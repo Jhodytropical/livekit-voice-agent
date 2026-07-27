@@ -1,0 +1,58 @@
+[project]
+name = "livekit-voice-agent"
+version = "0.1.0"
+description = "Inbound appointment-booking voice agent on LiveKit Agents, with a reusable idempotent tool runtime."
+requires-python = ">=3.10,<3.15"
+license = { text = "MIT" }
+
+# Direct dependencies are pinned exactly. The full transitive set (including
+# indirect deps) is captured in requirements.lock.txt — install from that file
+# for a reproducible environment.
+dependencies = [
+    "livekit-agents[deepgram,openai,silero,turn-detector]==1.6.7",
+    "pydantic==2.13.4",
+    "python-dotenv==1.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+    "ruff==0.14.4",
+    "mypy==1.18.2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "S", "ASYNC"]
+# S101: pytest uses bare asserts.
+per-file-ignores = { "tests/*" = ["S101"] }
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+# livekit-agents and its plugins ship py.typed, so their real types are used
+# rather than skipped — that is the point of type-checking this at all.
+files = ["src", "scripts"]
+strict = true

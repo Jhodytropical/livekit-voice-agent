@@ -1,0 +1,5 @@
+# Direct dependencies, pinned. Mirrors [project.dependencies] in pyproject.toml.
+# For a byte-for-byte reproducible environment install requirements.lock.txt instead.
+livekit-agents[deepgram,openai,silero,turn-detector]==1.6.7
+pydantic==2.13.4
+python-dotenv==1.1.1

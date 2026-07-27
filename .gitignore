@@ -1,0 +1,35 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model caches downloaded at runtime (Silero VAD, turn detector)
+.cache/
+models/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local run logs — may contain caller names/numbers. Never commit.
+logs/
+
+# Local edit backups — never publish.
+*.bak

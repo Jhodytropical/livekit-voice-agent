@@ -119,3 +119,54 @@ it what day it is, it will confidently pick one — and it will pick wrong.**
   attempt step 4 on the greeting; it will record a false failure.
 - OpenAI API billing is separate from ChatGPT Plus. A key with no credit returns
   `429 insufficient_quota`, which looks nothing like an auth problem.
+
+---
+
+# Run 2 — 2026-07-27, 11:35 (instrumented)
+
+`_instrument_barge_in()` live. Config: `min_words=2`, `min_duration=0.4` (shipping).
+
+## Step 4 — BARGE-IN, MEASURED
+
+VAD onset → playout stop, direct from the event pair. Not inferred.
+
+| # | ms |
+|---|---|
+| 1 | 349.2 |
+| 2 | 849.3 |
+| 3 | 950.9 |
+| 4 | 1000.0 |
+
+n=4 · min 349 · median 900 · max 1000 · mean 787.
+
+a. Audio stopped in:      ☐ <300ms  ☑ 349ms once  ☑ 850–1000ms typical
+b. Stopped mid-word:      ☑ yes — assistant text truncates mid-phrase
+c. Words in transcript:   ☑ complete
+d. Agent then:            ☑ answered the interruption, never resumed its old line
+
+5 of 9 `agent_stopped_speaking` events logged `barge_in_latency_ms: null` — the agent
+finishing its own sentence. The discrimination works; it is not labelling every stop a
+barge-in.
+
+## Step 5 — cough / "mm-hm"
+☐ pass ☐ fail — **NOT OBSERVED AGAIN.** Second attempt, second time nothing reached
+the log. Either the cough never tripped VAD, or it tripped and was filtered without
+emitting an event. Needs a deliberate, loud, ≥0.5s non-speech noise while the agent is
+mid-sentence, with the log watched live.
+
+## Step 3 — date handling, third confirmation
+- "Today, Monday, we have openings at 9 in the morning or 10 in the morning."
+- Asked for Wednesday → "On Wednesday, we have openings at 9 in the morning or 10..."
+- Pushed for 9:30 → "I don't see a 9:30 opening on Wednesday, but we do have 9:00 or
+  10:00." **Refused to invent, again.**
+
+## Step 7 — booking: PARTIAL
+Agent asked: *"Can I have the phone number you want to use for the booking? I will read
+it back to..."* — correct behaviour, read-back promised. Caller declined to give one, so
+**`book_appointment` still has never executed on a live call.** This is now the single
+largest untested path.
+
+## Step 10 — lead capture: PARTIAL
+On decline the agent offered: *"If you want to book later, I can take your name and
+phone number to have someone follow up with you."* Correct instinct — but no
+`capture_lead` tool call, because the caller declined that too.

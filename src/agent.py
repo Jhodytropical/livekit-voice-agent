@@ -109,8 +109,14 @@ def _instrument_barge_in(session: AgentSession[None]) -> None:
     def _on_user(ev: Any) -> None:
         if getattr(ev, "new_state", None) == "speaking":
             marks["user_speaking_at"] = time.time()
-            logger.info(json.dumps({"event": "user_started_speaking",
-                                    "timestamp": round(marks["user_speaking_at"], 4)}))
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "user_started_speaking",
+                        "timestamp": round(marks["user_speaking_at"], 4),
+                    }
+                )
+            )
 
     @session.on("agent_state_changed")
     def _on_agent(ev: Any) -> None:
@@ -118,14 +124,22 @@ def _instrument_barge_in(session: AgentSession[None]) -> None:
         new_state = getattr(ev, "new_state", None)
         if new_state == "speaking":
             marks["agent_speaking_at"] = time.time()
-            logger.info(json.dumps({"event": "agent_started_speaking",
-                                    "timestamp": round(marks["agent_speaking_at"], 4)}))
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "agent_started_speaking",
+                        "timestamp": round(marks["agent_speaking_at"], 4),
+                    }
+                )
+            )
         elif old_state == "speaking":
             now = time.time()
             started = marks.get("user_speaking_at")
             # Only a stop that follows a user onset is a barge-in. A stop with no
             # preceding onset is the agent simply finishing its sentence.
-            overlap = now - started if started and started > marks.get("agent_speaking_at", 0) else None
+            overlap = (
+                now - started if started and started > marks.get("agent_speaking_at", 0) else None
+            )
             logger.info(
                 json.dumps(
                     {
@@ -136,7 +150,6 @@ def _instrument_barge_in(session: AgentSession[None]) -> None:
                     }
                 )
             )
-
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ plugin resolution, settings parsing, VAD model load, turn-handling construction,
 agent + tool registration, and one real tool round-trip through the runtime.
 
 It never connects to LiveKit and never requires a credential. It loads .env.local
-if present and reports which credentials are missing rather than failing on them, so it is useful both on a
-laptop with no keys and in CI.
+if present and reports which credentials are missing rather than failing on them,
+so it is useful both on a laptop with no keys and in CI.
 
     .venv/bin/python scripts/smoke.py
 

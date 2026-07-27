@@ -21,12 +21,12 @@ Built against **`livekit-agents==1.6.7`** (released 2026-07-25) on Python 3.12.8
 
 | | |
 |---|---|
-| Tool runtime | Built, 67 automated tests passing |
+| Tool runtime | Built, 68 automated tests passing |
 | Live browser call | **Run — 2026-07-27.** Four sessions against LiveKit Cloud, real audio both directions |
 | Refusal to invent availability | **Verified live**, under pressure. See [Live findings](#live-findings-2026-07-27) |
 | Date handling | **Bug found live and fixed.** See [Live findings](#live-findings-2026-07-27) |
 | Barge-in — does it interrupt? | **Verified live.** Speech truncates mid-phrase, caller's words survive intact, agent answers the interruption |
-| Barge-in — *how fast*, in ms | **Not measured.** Instrumentation added after the first attempt failed; see [Blocked](#blocked--not-verified) |
+| Barge-in — *how fast*, in ms | **Measured live 2026-07-27:** n=4, **349–1000 ms, median 900 ms** (`min_words=2`). See [Measured barge-in latency](#measured-barge-in-latency-2026-07-27-live-call) |
 | Recorded demo call | Screen recording captured; not yet cut |
 
 Nothing in this README claims a working cloud session it didn't have. Every
@@ -338,6 +338,44 @@ Every value is set explicitly, including ones matching the framework default. On
 a receptionist call the defaults are not self-evidently right, and an inherited
 default is invisible in code review.
 
+### Measured barge-in latency (2026-07-27, live call)
+
+VAD onset to playout stop, taken from `_instrument_barge_in()` — not inferred from
+log ordering. Shipping config: `min_words=2`, `min_duration=0.4`.
+
+| # | Latency |
+|---|---|
+| 1 | **349 ms** |
+| 2 | **849 ms** |
+| 3 | **951 ms** |
+| 4 | **1000 ms** |
+
+**n=4 · min 349 ms · median 900 ms · max 1000 ms.**
+
+**What this does and does not support.** One session, one caller, one audio path
+(MacBook built-in mic, consumer broadband, US East region). Four data points is
+enough to state an order of magnitude and nothing finer. **Do not quote a sub-500 ms
+figure from this** — 349 ms happened once and the median is roughly triple it.
+
+The honest summary is: *the agent yields inside a second, usually around 900 ms.*
+
+**Why the spread, and why it is not noise.** With `min_words=2` the interruption
+cannot fire until speech-to-text has emitted two words, so latency tracks how long
+the caller talks before the transcript finalises — not a fixed timer. The 349 ms case
+was a fast two-word cut-in; the ~950 ms cases were longer phrases. That means the
+tunable is not really a delay knob:
+
+- `min_words ≥ 1` → gated on STT finalising. Variable, roughly 350–1000 ms observed.
+  Immune to coughs, because a cough produces no words.
+- `min_words = 0` → gated on VAD alone, so `min_duration` becomes the only floor.
+  Should be more consistent, at the cost of yielding to any noise longer than
+  `min_duration`. **Not measured** — see [Blocked](#blocked--not-verified).
+
+The instrumentation only reports a latency when a stop follows a user onset during
+agent speech; the agent finishing its own sentence logs `barge_in_latency_ms: null`.
+In this session 5 of 9 stops were the agent finishing normally, so the discrimination
+is doing real work rather than labelling everything a barge-in.
+
 ### Why these values
 
 - **`min_duration=0.4` + `min_words=2` together.** Energy alone is a bad
@@ -575,7 +613,7 @@ Every command below was run in this repo. Output is verbatim.
 
 ```
 $ ./.venv/bin/python -m pytest -q
-64 passed in 6.31s
+68 passed in 6.32s
 
 $ ./.venv/bin/ruff check src tests scripts
 All checks passed!
@@ -611,8 +649,8 @@ types are used rather than skipped. **There are no `# type: ignore` comments in
 | `test_validation.py` | 6 | missing/out-of-range/unknown fields; oversized payload; unregistered tool; error text doesn't echo input |
 | `test_retry.py` | 7 | transient retried then succeeds; bounded at `max_attempts`; backoff capped; permanent not retried; unexpected exception not retried and not leaked; timeout treated as transient; unbounded config rejected |
 | `test_invocation_log.py` | 6 | record fields; PII masked; JSON-serializable; failure recorded; sanitizer behaviour |
-| `test_appointment_tools.py` | 11 | the three tools; determinism; weekend/past-date rules; double-book prevention (both guards); sanitized records |
-| `test_livekit_tools.py` | 9 | wrapper → runtime plumbing; turn id from `speech_handle`; `disallow_interruptions` on writes; `ToolError` mapping; no data leak in errors |
+| `test_appointment_tools.py` | 12 | the three tools; determinism; weekend/past-date rules; double-book prevention (both guards); sanitized records |
+| `test_livekit_tools.py` | 13 | wrapper → runtime plumbing; turn id from `speech_handle`; `disallow_interruptions` on writes; `ToolError` mapping; no data leak in errors; date-anchor regression cases |
 | `test_barge_in.py` | 9 | interruption config; `AgentSession` accepts it; interrupt stops speech; uninterrupted control case; uninterruptible speech; forced interrupt |
 | `test_config.py` | 9 | defaults; `REPLACE_ME` ≠ credential; secrets never stored; validation; credential-free startup |
 
@@ -680,32 +718,39 @@ Redis, database, frontend, deployment.
 
 Honest list. None of these are hidden elsewhere in this README.
 
-1. **Barge-in latency in milliseconds.** Interruption is confirmed to work; how
-   fast is unmeasured. `min_duration=0.4` and `min_words=2` remain reasoned
-   defaults. `_instrument_barge_in()` makes this a three-minute call to settle —
-   see [finding 3](#3-barge-in-works-its-latency-is-not-yet-measured--and-the-first-attempt-was-wrong).
-2. **False-positive rejection (cough, "mm-hm") not observed.** Attempted, but no
-   corresponding event appeared in the log, so it is scored neither pass nor fail.
-3. **Booking not completed end to end on a live call.** `check_availability` ran
-   live and correctly; `book_appointment` and `capture_lead` are covered by
-   automated tests only. Steps 7–11 of the manual script remain unrun.
-4. **No recorded demo cut.** A screen recording of a live call exists; it has not
-   been edited into a demo.
-5. **No Vapi-vs-LiveKit barge-in comparison.** Needs both stacks on a live call.
-6. **LiveKit audio turn detector not exercised.** `turn_detection="vad"` is what
-   ships and what is tested. `inference.TurnDetector()` needs LiveKit Inference
-   credentials.
+1. **Barge-in latency beyond one audio path.** Measured at 349–1000 ms, median
+   900 ms, but from **n=4 on a single session, single mic, single region**. Nothing
+   here characterises a phone call, a headset, or a noisy room. Treat the number as
+   an order of magnitude.
+2. **`min_words=0` never measured.** The claim that VAD-only gating gives more
+   consistent latency is reasoning, not data. It is a one-call experiment and it has
+   not been run.
+3. **False-positive rejection (cough, "mm-hm") not observed.** Attempted twice across
+   two sessions; no corresponding event reached the log either time, so it is scored
+   neither pass nor fail.
+4. **Booking not completed end to end on a live call.** `check_availability` ran live
+   and correctly, and the agent asked for a phone number with a read-back promise —
+   but no `book_appointment` call has ever executed live. Covered by automated tests
+   only. Steps 7–11 of the manual script remain unrun.
+5. **No recorded demo cut.** Screen recordings of live calls exist; none has been
+   edited into a demo.
+6. **No Vapi-vs-LiveKit barge-in comparison.** Needs both stacks on a live call.
+7. **LiveKit audio turn detector not exercised.** `turn_detection="vad"` is what ships
+   and what is tested. `inference.TurnDetector()` needs LiveKit Inference credentials.
 8. **LiveKit's own test framework not used.** `session.run(user_input=…)` and the
-   `judge()` helpers require an LLM instance, so they need credentials. The tests
-   here drive `AgentSession` directly instead.
+   `judge()` helpers require an LLM instance, so they need credentials. The tests here
+   drive `AgentSession` directly instead.
 
 ### Next, in order
 
-1. One call with `_instrument_barge_in()` running → real latency numbers →
-   replace the reasoned defaults in [Barge-in](#barge-in).
-2. Steps 7–11 of the manual script: booking, double-fire guard, lead capture,
-   log check.
-3. Cut the recorded call into a demo.
+1. Steps 7–11 of the manual script: complete a booking live, fire the double-fire
+   guard, capture a lead, check the logs for leaked PII. This is the biggest remaining
+   gap — the write path has never run against live audio.
+2. A deliberate cough/noise test that actually lands in the log, to settle
+   false-positive rejection one way or the other.
+3. `min_words=0` on one call, to test whether VAD-only gating is more consistent than
+   the 349–1000 ms spread STT gating produces.
+4. Cut a recorded call into a demo.
 
 ---
 

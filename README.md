@@ -634,13 +634,10 @@ Every command below was run in this repo. Output is verbatim.
 
 ```
 $ ./.venv/bin/python -m pytest -q
-68 passed in 6.32s        # 2026-07-27, macOS, project .venv
+132 passed in 13.17s
 
 $ ./.venv/bin/ruff check src tests scripts
 All checks passed!
-
-$ python3 -m pytest -q   # 2026-07-28, Linux, livekit-agents 1.6.7, after the run-3 fixes
-82 passed in 8.18s
 
 $ ./.venv/bin/ruff format --check src tests scripts
 26 files already formatted

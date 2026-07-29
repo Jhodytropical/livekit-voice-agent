@@ -28,6 +28,7 @@ Built against **`livekit-agents==1.6.7`** (released 2026-07-25) on Python 3.12.8
 | Barge-in — does it interrupt? | **Verified live.** Speech truncates mid-phrase, caller's words survive intact, agent answers the interruption |
 | Barge-in — *how fast*, in ms | **n=5, 449–1200 ms, median 653 ms.** Every sample confirmed by two independent signals — see [Measured barge-in latency](#measured-barge-in-latency-live-calls) |
 | Recorded demo call | Screen recording captured; not yet cut |
+| Azure Container Apps deploy | **Built, never run.** Manifest and script verified by construction — no resource created, no image built, no call answered by a container. See [Deploy](#deploy-azure-container-apps) |
 
 Nothing in this README claims a working cloud session it didn't have. Every
 "verified" statement maps either to a command in [Verification](#verification) or
@@ -182,7 +183,7 @@ mypy==1.18.2
 ```bash
 # Everything that works with no credentials at all:
 ./.venv/bin/python scripts/smoke.py          # startup + config smoke test
-./.venv/bin/python -m pytest                 # 63 tests
+./.venv/bin/python -m pytest                 # 132 tests
 ./.venv/bin/ruff check src tests scripts
 ./.venv/bin/ruff format --check src tests scripts
 ./.venv/bin/mypy
@@ -198,6 +199,40 @@ mypy==1.18.2
 `python src/agent.py --help` runs with no credentials and lists them
 (`console`, `start`, `dev`, `connect`, `download-files`) — useful for confirming
 the module imports cleanly before you have keys.
+
+---
+
+## Deploy (Azure Container Apps)
+
+```bash
+az login
+PLAN_ONLY=1 ./infra/deploy-azure.sh   # print the plan, create nothing
+./infra/deploy-azure.sh               # provision, build remotely, deploy, verify
+```
+
+`infra/README.md` has the reasoning. The three decisions worth knowing before you read
+the manifest:
+
+- **`minReplicas: 1`, and no `ingress` block.** Scale-to-zero is the usual reason to pick
+  Container Apps and it is exactly wrong here. This worker is not woken by an inbound
+  request — it dials *out* to LiveKit and waits to be handed a job. Scaled to zero, there
+  is no worker to dispatch to and the caller hears silence. Nothing dials in, so there is
+  no ingress and no public FQDN either.
+- **No registry password exists.** The registry is created with `--admin-enabled false`
+  and the app pulls with a user-assigned managed identity holding `AcrPull`. A credential
+  that was never created cannot leak or need rotating.
+- **The image is built by `az acr build`, not `docker build`.** No local daemon, and the
+  result is `linux/amd64` regardless of the Mac it was launched from — an arm64 image
+  fails on Container Apps with an error that does not say so.
+
+Model weights are **not** baked by default. Silero VAD ships inside its wheel and needs no
+download (verified: empty cache, `HF_HUB_OFFLINE=1`, loads in 2.3 s); the only thing
+`download-files` fetches is 461 MB of turn-detector weights that this agent never loads,
+because `turn_handling.py` pins `turn_detection: "vad"`. Build with
+`BAKE_TURN_DETECTOR=1` if you make that swap.
+
+**Not yet deployed.** See [Blocked](#blocked--not-verified) item 14 — the artifacts are
+verified by construction, not by a run.
 
 ---
 
@@ -260,7 +295,8 @@ src/
       adapters.py                   DemoCalendar, DemoCrm
       registry.py                   wires the three tools into a ToolRuntime
 scripts/smoke.py                    credential-free startup + config smoke test
-tests/                              63 tests
+tests/                              132 tests
+infra/                              Azure Container Apps manifest + deploy script
 ```
 
 ### The tool runtime interface
@@ -739,12 +775,16 @@ Redis, database, frontend, deployment.
 
 Honest list. None of these are hidden elsewhere in this README.
 
-1. **Barge-in latency is measured on a contaminated dataset.** 13 of 17 logged samples
-   are coincident stops rather than interruptions. The corroborated figure is
-   **502–1100 ms, median 900 ms, n=4**, single mic, single region, and n=4 is a lower
-   bound because the corroboration is itself a heuristic. Nothing
-   here characterises a phone call, a headset, or a noisy room. Treat the number as
-   an order of magnitude.
+1. ~~**Barge-in latency is measured on a contaminated dataset.**~~ **Fixed 2026-07-28.**
+   The v2 instrument counted 13 of 17 samples as interruptions when they were coincident
+   stops. The shipping instrument (v5) pairs each stop with its own assistant item and
+   requires two independent signals to agree; a disagreement is recorded as
+   `signals_disagree` and contributes no latency. The current figure is
+   **449–1200 ms, median 653 ms, n=5** (run 7). **The residual limitation is not the
+   instrument any more, it is the sample:** n=5, one microphone, one region, one network.
+   Nothing here characterises a phone call, a headset, or a noisy room. Quote it as
+   *"yields inside about a second, typically around 650 ms"* — never as a sub-450 ms
+   figure, and never with the median as a ceiling.
 2. **`min_words=0` never measured.** The claim that VAD-only gating gives more
    consistent latency is reasoning, not data. It is a one-call experiment and it has
    not been run.
@@ -795,23 +835,36 @@ Honest list. None of these are hidden elsewhere in this README.
 13. **LiveKit's own test framework not used.** `session.run(user_input=…)` and the
    `judge()` helpers require an LLM instance, so they need credentials. The tests here
    drive `AgentSession` directly instead.
+14. **Never deployed.** `Dockerfile`, `infra/containerapp.yaml` and
+   `infra/deploy-azure.sh` exist and are verified by construction — the manifest
+   deserializes through the same SDK models `az containerapp create --yaml` uses, the
+   secret-rendering step round-trips hostile values byte-for-byte, `shellcheck` is clean,
+   and every `az` flag was checked against the installed CLI. **None of it has run.** No
+   Azure resource has been created, no image built, and no call has been answered by a
+   container. "Deployable" is the claim; "deployed" is not.
 
 ### Next, in order
 
-1. **Correlate barge-in stops against playout truncation** so the latency figure stops
-   counting coincident stops. Highest-value fix: it is the number most likely to be quoted.
-2. **Extend the confirmation guard to availability statements.** Run 4 had the agent say
-   3 PM was the only afternoon slot while 1 PM was open — same overclaim family, not
-   covered by the current wording.
-3. **Run 5: state a preference *before* booking**, to close the one ordering the run-4
-   verification did not cover.
-4. Steps 8, 9 and 10 of the manual script: double-fire guard, uninterruptible write,
-   and `capture_lead` — none has run on live audio.
-5. A deliberate cough/noise test that actually lands in the log. Four attempts, four
-   no-shows.
-6. `min_words=0` on one call — but only after item 1, since the current spread is not
-   trustworthy enough to compare against.
-7. Cut a recorded call into a demo. Raw footage: run 3 and run 4 screen recordings.
+Items 1–5 of the previous list are done: the barge-in instrument was corrected through
+five versions and re-measured (run 7), the confirmation guard was extended to availability
+statements, `book_appointment` ran end-to-end on live audio, `capture_lead` ran live, and
+the cough test finally landed in the log. What is left:
+
+1. **Run the Azure deploy.** `./infra/deploy-azure.sh`, confirm `registered worker` in the
+   container's logs, then place a real call with no local `dev` process running. This is
+   the only item that converts "deployable" into "deployed", and it blocks a $100–150/hr
+   job class that screens on it.
+2. **Read-back check for `capture_lead`** (Blocked item 7). `book_appointment` refuses to
+   write unless its own read-back matches; `capture_lead` has no equivalent. An oversight,
+   not a decision, and the fix is the existing `verify_readback` call.
+3. **Stop reciting the full phone number after the write** (Blocked item 8). Read-back
+   *before* a write is deliberate; repeating the digits afterwards is spoken into whatever
+   room the caller is in.
+4. **Widen the barge-in sample.** n=5 on one mic, one region. The instrument is now
+   trustworthy; the dataset is not yet wide enough to characterise a phone call.
+5. `min_words=0` on one call, for comparison — now meaningful, since item 1 of the old
+   list is fixed and the baseline can be trusted.
+6. Cut a recorded call into a demo. Raw footage: runs 3, 4 and 5 screen recordings.
 
 ---
 

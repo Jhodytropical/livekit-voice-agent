@@ -1,0 +1,53 @@
+# Secrets — must never enter the build context, let alone a layer.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Local run logs contain caller names and spoken digits. See log_redaction.py.
+logs/
+
+# Local venv: 3.12 macOS binaries, useless and large in a linux image.
+.venv/
+venv/
+
+# Caches and build noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Model caches are baked in the build stage, not copied from the host.
+.cache/
+models/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Backups and scratch — never publish, never build.
+*.bak
+*.bak.*
+*.bak[0-9]*
+_to_delete/
+
+# Docs, tests and deploy tooling are not needed at runtime; excluding them keeps
+# the context small and the image free of anything that is not the agent.
+# NOTE: `*.md` only matches the root in Docker's ignore syntax — nested markdown
+# needs `**/*.md`, which is why both patterns are here.
+docs/
+tests/
+scripts/
+infra/
+*.md
+**/*.md
+.git/
+.github/

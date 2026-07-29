@@ -1,0 +1,136 @@
+# Azure Container Apps manifest for the inbound voice agent.
+#
+# THIS FILE CONTAINS NO SECRETS AND IS SAFE TO COMMIT.
+# The double-underscore placeholder tokens below are replaced at deploy time by
+# deploy-azure.sh, which reads the values from .env.local (gitignored),
+# writes the rendered copy to a 0600 file in a private temp dir, and
+# deletes it on exit. See infra/README.md, "Why the secrets look like this".
+#
+# Schema: Microsoft.App/containerApps, API 2025-10-02-preview.
+# Field names verified against the azure-mgmt-appcontainers models the
+# containerapp CLI extension deserializes into — not from memory.
+
+location: __LOCATION__
+type: Microsoft.App/containerApps
+
+# User-assigned identity, not system-assigned. A system-assigned identity does
+# not exist until the app exists, so it cannot hold AcrPull at create time —
+# the CLI works around that by first deploying a hello-world image and then
+# swapping it, which is a two-revision deploy and only works on the flag path,
+# not with --yaml. A user-assigned identity is created and granted AcrPull
+# BEFORE the app, so the first revision pulls the real image on the first try.
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    __IDENTITY_RESOURCE_ID__: {}
+
+properties:
+  environmentId: __ENVIRONMENT_ID__
+  configuration:
+    activeRevisionsMode: Single
+
+    # No ingress key at all. This worker accepts no inbound traffic: it dials
+    # out to LiveKit over a websocket and waits to be assigned jobs. Omitting
+    # ingress means no public FQDN and no listener to attack.
+
+    registries:
+      - server: __ACR_LOGIN_SERVER__
+        identity: __IDENTITY_RESOURCE_ID__
+        # No username. No passwordSecretRef. The registry password never
+        # exists, so it cannot be committed, logged, or rotated late.
+
+    secrets:
+      - name: livekit-url
+        value: __LIVEKIT_URL__
+      - name: livekit-api-key
+        value: __LIVEKIT_API_KEY__
+      - name: livekit-api-secret
+        value: __LIVEKIT_API_SECRET__
+      - name: deepgram-api-key
+        value: __DEEPGRAM_API_KEY__
+      - name: openai-api-key
+        value: __OPENAI_API_KEY__
+
+  template:
+    containers:
+      - name: voice-agent
+        image: __IMAGE__
+
+        env:
+          # The five the agent refuses to start without (config.py:
+          # REQUIRED_CREDENTIAL_VARS). LIVEKIT_URL is held as a secret rather
+          # than a plain env var: it is not sensitive by itself, but it names
+          # the project the API key belongs to, and splitting a credential
+          # pair across two storage classes is how half of one ends up in a
+          # log line.
+          - name: LIVEKIT_URL
+            secretRef: livekit-url
+          - name: LIVEKIT_API_KEY
+            secretRef: livekit-api-key
+          - name: LIVEKIT_API_SECRET
+            secretRef: livekit-api-secret
+          - name: DEEPGRAM_API_KEY
+            secretRef: deepgram-api-key
+          - name: OPENAI_API_KEY
+            secretRef: openai-api-key
+
+          # LOG_TRANSCRIPTS is deliberately absent. Unset means caller speech is
+          # stripped from log lines and only word counts and timings survive
+          # (log_redaction.py). Setting it to 1 in a hosted deployment would put
+          # every caller's spoken phone number into Log Analytics. Do not add it
+          # here — use a local dev run for a verbatim transcript.
+
+        resources:
+          # Sized from the local runs, not guessed: the worker holds a Silero
+          # VAD session plus one aiohttp client per job. 1 vCPU / 2 GiB is the
+          # smallest Container Apps combination that leaves headroom for the
+          # onnx session; 0.5/1.0 is enough at idle and thrashes on the second
+          # concurrent call.
+          cpu: 1.0
+          memory: 2.0Gi
+
+        probes:
+          # livekit-agents serves GET / on the health port and returns 503 when
+          # the inference subprocess has died or the LiveKit connection failed
+          # (worker.py health_check). That makes this a real liveness signal
+          # rather than "the process object still exists": a worker that has
+          # silently lost its LiveKit websocket takes no calls, looks healthy to
+          # a process check, and gets restarted by this one.
+          - type: Liveness
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Startup probe with a long budget. Cold start loads the Silero onnx
+          # session and registers with LiveKit; the liveness probe must not fire
+          # during that window or the app restart-loops on a slow start.
+          - type: Startup
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+
+    scale:
+      # minReplicas: 1, NOT 0. Scale-to-zero is the usual reason to choose
+      # Container Apps, and it is exactly wrong here. This worker is not woken
+      # by an inbound request — it must already be connected to LiveKit when a
+      # call arrives, or LiveKit has no worker to dispatch the job to and the
+      # caller hears nothing. A scaled-to-zero voice agent is a disconnected
+      # phone line.
+      minReplicas: 1
+
+      # maxReplicas: 2 with no scale rules is deliberate and means "pinned at 1".
+      # Container Apps' default scaler is HTTP concurrency, which cannot fire
+      # without ingress, so replicas stay at minReplicas. The headroom exists so
+      # that adding a KEDA rule later is a manifest edit, not a redeploy of a
+      # differently-shaped app. Capacity today is one worker's job slots
+      # (num_idle_processes), which is the right first limit to hit and measure.
+      maxReplicas: 2
+      rules: []

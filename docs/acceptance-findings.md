@@ -1209,6 +1209,32 @@ Unchanged by this run, and listed so the tally stays honest:
 5. **Nothing verifies the caller said yes.** The structural check confirms the digits match;
    agreement is still unverified. Run 8 does not change this — the caller confirmed properly.
 
+## ✅ Teardown — verified clean, 2026-07-28 23:32 EDT
+
+`az group delete -n rg-voice-agent --yes --no-wait` was issued at ~22:30 EDT. Confirmed complete
+about an hour later:
+
+```
+az group list -o table                 -> (empty)
+az resource list ... -o table          -> (empty)
+az group delete -n ME_cae-voice-agent_rg-voice-agent_eastus2 --yes
+                                       -> ResourceGroupNotFound
+```
+
+**Nothing is billing.** `az group list` returning empty means the subscription is back to its
+pre-deploy state — `rg-voice-agent` was the only group in it. The `ME_` check matters because
+Azure Container Apps can create a managed infrastructure resource group *outside* the one you
+delete; here it either never existed or cleaned itself up. Checked rather than assumed.
+
+The Log Analytics workspace (`workspace-rgvoiceagentZ0p7`) lived inside `rg-voice-agent` and went
+with it — which is also why the run-8 logs were unrecoverable from Azure.
+
+**Cost posture:** this deployment is stood up for a demonstration and torn down after. The durable
+asset is `infra/`, which reproduces the whole environment in about ten minutes. `minReplicas: 1`
+with no ingress means an always-on replica billed per vCPU-second rather than per call, and
+Microsoft's free grant (180,000 vCPU-seconds / 360,000 GiB-seconds per month) covers roughly 7% of
+one 1-vCPU / 2-GiB replica running continuously. Leaving it up is a recurring charge for nothing.
+
 ## 🔴 Process defect — the log was not preserved before teardown
 
 The resource group was deleted with `--no-wait` before `logs/azure_run8.log` was written.

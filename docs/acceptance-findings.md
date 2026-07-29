@@ -170,3 +170,833 @@ largest untested path.
 On decline the agent offered: *"If you want to book later, I can take your name and
 phone number to have someone follow up with you."* Correct instinct — but no
 `capture_lead` tool call, because the caller declined that too.
+
+---
+
+# Run 3 — 2026-07-28, 15:05–15:07 EDT (the booking run)
+
+Log: `logs/agent_run3.log` (45,563 bytes) · Recording: `~/Desktop/Screen Recording 2026-07-28 at 3.04.59 PM.mov` (178 MB)
+Config unchanged from run 2: `min_words=2`, `min_duration=0.4`, `false_interruption_timeout=2.0`.
+
+A first session (`console-0fe8e9f4`, 15:04:41) was abandoned 1.4 s into the greeting —
+participant disconnect, not a defect. The run below is `console-57f3c5e6`.
+
+## ✅ Step 7 — BOOKING: `book_appointment` EXECUTED ON LIVE AUDIO
+
+The path that had never run. Verbatim from the log:
+
+```json
+{"event": "tool_invocation", "timestamp": 1785265615.125752,
+ "turn_id": "speech_86ac621242b7", "tool": "book_appointment",
+ "idempotency_key": "tk_b0a20ca7f536a5ba948dd0dabdc1b3cd",
+ "args": {"slot_id": "2026-07-29T13:00", "caller_name": "J***[redacted]",
+          "phone": "******5555", "email": null, "reason": "d***[redacted]"},
+ "status": "ok", "attempts": 1, "latency_ms": 0.31, "error": null}
+```
+
+One call, `ok`, first attempt, 0.31 ms. **Capability gap 2 is closed.**
+
+Supporting behaviour in the same exchange:
+
+| Check | Result | Evidence |
+|---|---|---|
+| Read-back before writing | PASS (grouped, not digit-by-digit) | *"To confirm, your phone number is 305-555-5555? Is that correct?"* — the write fired only after *"Yes. That's right."* |
+| Asked for digits explicitly | PASS | *"Could you please say your phone number, digit by digit, so I can make sure I have it right?"* |
+| Digits assembled from fragments | PASS | STT committed the number as **three separate turns** (`"Three zero five."` / `"Five five five,"` / `"five five five five."`). The LLM reassembled all 10 digits correctly. |
+| Date anchoring | PASS (4th confirmation) | *"tomorrow"* → `check_availability {"date": "2026-07-29"}` |
+| No invented slots | PASS (4th confirmation) | Caller pushed for 1:30 PM → *"We don't have a 1:30 PM slot available tomorrow. Would you prefer 1 PM"* |
+
+## 🔴 NEW DEFECT 1 — hallucinated fulfilment: the agent confirmed a constraint it never recorded
+
+The caller said **"I need a female doctor."** The agent replied *"Thanks for letting me know
+about the female doctor preference"* and, after the booking, confirmed:
+
+> **"Your dental appointment is set for 1 PM tomorrow with a female doctor."**
+
+Nothing in the system recorded that preference. The tool args carried
+`reason: "dental appointment"` and nothing else. `BookAppointmentArgs` has
+`extra="forbid"`, so the model **could not** have passed it even if it tried — the schema
+did its job. The failure is downstream: **the agent verbally committed to a constraint the
+write does not contain.**
+
+Severity: this is the highest-severity finding in any run so far. The date-anchor bug (run 1)
+produced a *visible* failure — the agent could not book. This one produces a *silent* one: the
+caller hangs up satisfied and arrives to a booking that does not match what they were promised.
+A real clinic gets a complaint; a real client gets a liability.
+
+Two candidate fixes, unbuilt pending a decision:
+
+- **(a) Instruction guard** — forbid confirming any detail that is not present in the tool
+  result. Smallest change, addresses the safety failure directly.
+- **(b) Schema field** — add a bounded `preferences` / `notes` field to `BookAppointmentArgs`
+  so constraints can actually be captured. Addresses the product gap, widens the trust boundary.
+
+(a) is the fix. (b) is a feature. Doing (b) alone would not prevent the next hallucinated
+confirmation about something *else*.
+
+## 🔴 NEW DEFECT 2 — step 11 FAILS: raw PII reaches the log file
+
+**The project's own sanitizer works.** `sanitize_args` masked every sensitive field:
+`caller_name → "J***[redacted]"`, `phone → "******5555"`, `reason → "d***[redacted]"`.
+Because the caller used a real name rather than the scripted synthetic one, this is now
+verified against **real** PII, which is stronger evidence than the synthetic test would have been.
+
+**But the sanitizer is not the only writer to that file.** 2 ms earlier, LiveKit's own
+framework logger emitted the unredacted arguments:
+
+```
+15:06:55,123 - DEBUG livekit.agents - executing tool {"function": "book_appointment",
+  "arguments": "{\"slot_id\": \"2026-07-29T13:00\", \"caller_name\": \"<caller's real name>\",
+  \"phone\": \"3055555555\", \"email\": null, \"reason\": \"dental appointment\"}"
+```
+
+`sanitize.py`'s docstring claims sanitizing at the runtime rather than the sink means "a new log
+destination cannot accidentally start receiving raw PII." That claim is correct about *this
+project's* log lines and **wrong about the log file as a whole**. Any aggregator tailing this
+file gets raw caller PII from the framework's DEBUG line.
+
+Unverified mitigation: `dev` raises the root level to DEBUG and `start` is thought to run at INFO,
+which would suppress it in production. **That has not been tested and must not be claimed.** The
+explicit fix is to pin `logging.getLogger("livekit.agents").setLevel(logging.INFO)` or attach a
+redacting filter, so the guarantee does not depend on which CLI verb was typed.
+
+## ⚠️ NEW DEFECT 3 — instrumentation artifact: a 9.9 ms "barge-in"
+
+```
+15:06:04,891  user_started_speaking
+15:06:04,901  agent_stopped_speaking   barge_in_latency_ms: 9.9
+```
+
+9.9 ms is below any physically plausible playout-stop latency — the agent finished its own
+sentence (*"…Do any of these work for you?"*) as VAD onset happened to fire. The
+`_instrument_barge_in` discrimination rule (*"only a stop that follows a user onset is a
+barge-in"*) is necessary but not sufficient: coincidence defeats it.
+
+Suggested guard: discard any measured overlap below a floor (~100 ms) as a coincident stop
+rather than an interruption. **Excluded from the statistics below.**
+
+## Step 4 — barge-in, three new valid samples
+
+| Run 3 # | ms |
+|---|---|
+| 1 | 351.5 |
+| 2 | 1100.2 |
+| 3 | 1100.3 |
+| — | ~~9.9~~ excluded, see defect 3 |
+
+Pooled with run 2 (identical config, so pooling is legitimate):
+
+**n=7 · 349.2 · 351.5 · 849.3 · 950.9 · 1000.0 · 1100.2 · 1100.3**
+**min 349 · median 951 · max 1100 · mean 814**
+
+⚠️ **The README's "349–1000 ms, median 900 ms (n=4)" is now stale and its upper bound is
+understated.** Run 3 produced two samples above the previously claimed ceiling. Corrected
+figure: **349–1100 ms, median 951 ms, n=7.**
+
+## Not reached this run
+
+| Step | Status |
+|---|---|
+| 5 — cough / non-speech | **Still not observed.** Third consecutive run. |
+| 8 — double-fire | Not attempted; session ended after the booking |
+| 9 — talk over the confirmation | Not attempted |
+| 10 — `capture_lead` | Not attempted — still never executed live |
+
+## Note on protocol
+
+The run-3 script specified a synthetic caller (Marcus Webb / 305-555-0142 / 9:00 AM). The actual
+call used the caller's own real name, 305-555-5555, and the 1:00 PM slot. Recorded here because it
+changes what the evidence shows: the PII masking result is **stronger** than planned (verified
+against a real name), and the "female doctor" exchange — which produced defect 1 — was
+improvised and would not have occurred under the script. Deviating from the script found the
+most serious bug in the project. Worth remembering before over-scripting run 4.
+
+
+### A note on this file's own redactions
+
+The caller's real name is replaced with `<caller's real name>` throughout, including
+inside the quoted leak. Publishing the verbatim leak in the document that reports the
+leak would have been a neat way to commit the same error twice.
+
+`305-555-5555` is kept as written. It is a reserved fictional number that cannot route
+to anyone, and the read-back evidence in step 7 is weaker without a concrete value. The
+name is the PII here; the number is not.
+
+---
+
+# Fixes applied — 2026-07-28, same day
+
+## Defect 1 — hallucinated confirmation: FIXED
+
+`BASE_INSTRUCTIONS` in `appointment_agent.py` gains a "What you may confirm" block:
+confirm only what a tool recorded, name only the time when reading a booking back, and
+say plainly that an unrecordable request cannot be guaranteed rather than folding it
+into the confirmation. The origin bug is documented in a comment above the constant,
+in the same style as the date-anchor comment below it.
+
+**Honest limitation: this is a prompt fix, and prompt fixes are probabilistic.** It
+lowers the odds of a hallucinated confirmation; it cannot make them zero the way
+`extra="forbid"` makes an invented argument impossible. A deterministic fix would mean
+constraining what the agent may say — out of scope for this artifact. **Not yet
+re-tested on live audio.** Until it is, the correct claim is "found, understood, and
+mitigated in the prompt," never "fixed."
+
+## Defect 2 — PII in the framework's log line: FIXED and verified
+
+New module `src/voice_agent/log_redaction.py`. A `logging.Filter` on the
+`livekit.agents` logger rewrites `record.arguments` through the **same**
+`sanitize_args` the runtime uses, so one definition of "sensitive" now governs both
+writers to the log. Installed at import in `src/agent.py`, because every LiveKit job
+runs in its own process and the framework can log a tool call before any per-session
+setup would run.
+
+Design decisions worth keeping:
+
+- **Fails closed.** Any payload that will not parse into a mapping is replaced
+  wholesale. A redactor that passes the original through whenever it is confused is
+  not a redactor — the one oddly-shaped payload that breaks the parser is precisely
+  the one worth not printing.
+- **A filter, not `setLevel(INFO)`.** The framework's DEBUG stream carries
+  `received user transcript`, `user turn committed` and `aec warmup active` — the lines
+  that made runs 1-3 diagnosable at all. Silencing the stream to hide one field would
+  have cost more than it saved, and would have left the guarantee depending on which
+  CLI verb someone typed.
+- **Censors, never drops.** The line still records which tool ran.
+
+Verified by replaying the exact run-3 payload through the installed filter:
+
+```
+BEFORE fix : {"slot_id": "2026-07-29T13:00", "caller_name": "<real name>", "phone": "3055555555", ...}
+AFTER  fix : {"slot_id": "2026-07-29T13:00", "caller_name": "J***[redacted]", "phone": "******5555", ...}
+```
+
+14 regression tests in `tests/test_log_redaction.py`, including a fail-closed
+parametrized set and an end-to-end assertion through the real `livekit.agents` logger.
+Suite: **68 -> 82 tests, all passing.**
+
+## Defect 3 — the 9.9 ms artifact: DOCUMENTED, NOT FIXED
+
+Excluded from the statistics and explained in the README. The suggested floor (~100 ms)
+in `_instrument_barge_in` is **not implemented** — it would be inventing a threshold
+from a single observation. Left as a known limitation.
+
+---
+
+# Run 4 — 2026-07-28, 15:29–15:32 EDT (fix verification)
+
+Log: `logs/agent_run4.log` (46,932 bytes) · Recording: `~/Desktop/Screen Recording 2026-07-28 at 3.29.11 PM.mov` (277 MB)
+Caller: John Doe / ten 1s. Slot booked: `2026-07-29T15:00`.
+
+## ✅ Defect 1 — hallucinated confirmation: FIXED, verified twice
+
+The booking confirmation named the time and nothing else:
+
+> *"Your dental appointment is booked for tomorrow at three PM. If you have anything else, just let me know."*
+
+Compare run 3's *"set for 1 PM tomorrow with a female doctor."* Then two unrecordable
+requests, one scripted and one improvised, both handled correctly:
+
+| Caller | Agent |
+|---|---|
+| *"I would like to have a female doctor."* | *"I can pass along your preference for a female doctor, **but I can't guarantee it on this call.**"* |
+| *"And also maybe a wheelchair accessibility in the facility."* | *"I will make a note about your request for wheelchair accessibility, **but I cannot guarantee it on this call.**"* |
+
+**Residual coverage gap, stated plainly.** In run 3 the preference was given **before**
+the booking and got folded into the confirmation. In run 4 both requests came **after**
+the booking had already been confirmed. The exact run-3 ordering was therefore not
+reproduced. What is proven: the agent declines to guarantee unrecordable requests, and
+its booking confirmation carries no invented detail. What is not yet proven: that a
+preference stated *before* booking stays out of the confirmation. **Run 5 should state
+the preference first.** Until then this is strong evidence, not a closed regression.
+
+## ✅ Defect 2 — PII in the framework's log line: FIXED, verified in the real log
+
+The `livekit.agents` DEBUG line, which in run 3 carried the raw name and number:
+
+```
+15:31:42,611 - DEBUG livekit.agents - executing tool {"function": "book_appointment",
+  "arguments": "{\"slot_id\": \"2026-07-29T15:00\", \"caller_name\": \"J***[redacted]\",
+  \"phone\": \"******1111\", \"email\": null, \"reason\": \"d***[redacted]\"}"
+```
+
+Masked, in production conditions, by the filter — not by a replay. Note `"phone":
+"[redacted]"` on the invalid attempt: `_mask_phone` returns a full redaction below four
+digits rather than exposing a short number. Correct.
+
+**Known limitation this does NOT fix.** The caller's spoken words still reach the log
+verbatim through `received user transcript` and `conversation_item_added`. "John Doe"
+appears four times in `agent_run4.log` for exactly that reason. The redactor closes the
+*structured argument* leak; free-form transcript is a different and harder problem,
+because nothing marks which spoken words are PII. **Do not claim the logs are PII-free.**
+The defensible claim is: tool arguments are masked at both writers.
+
+## ✅ Step B — invalid arguments, first live execution
+
+Never exercised on live audio before. Caller gave "one one one":
+
+```json
+{"tool": "book_appointment", "args": {..., "phone": "[redacted]"}, "status": "invalid",
+ "attempts": 0, "latency_ms": 3.71, "error": "invalid arguments — phone: string_too_short"}
+```
+
+`attempts: 0` — the handler was never reached. The agent's recovery:
+
+> *"The phone number you gave is too short to book the appointment. Could you please provide the full phone number with all digits?"*
+
+Named the problem, asked again, invented nothing, and did not claim the booking went
+through. The error surfaced to the LLM names the field and the failure type and never
+echoes the caller's value.
+
+## 🔴 NEW DEFECT 4 — the agent understated availability
+
+The calendar was fresh, so `2026-07-29` had all four slots open: 09:00, 10:00, 13:00, 15:00.
+One `check_availability` call returned them at 15:29:56. Then:
+
+| Time | Line |
+|---|---|
+| 15:30:08 | agent: *"Tomorrow at four is actually not available, but I see openings at nine AM or ten AM."* |
+| 15:30:12 | caller: *"So you sure you don't see anything for the afternoon?"* |
+| 15:30:23 | agent: **"Yes, for tomorrow specifically, there is only a slot at three PM in the afternoon."** |
+
+**13:00 was open.** No second `check_availability` was issued — the agent had the correct
+data in context and misreported it. It did not *invent* a slot (that guard holds, five
+runs running); it asserted an exclusivity the tool result contradicts.
+
+This is defect 1's family — a claim stronger than the tool data supports — and the new
+"What you may confirm" block does not cover it, because that block governs *confirmations*,
+not *descriptions of availability*. A caller who needed 1 PM would have been told it did
+not exist.
+
+Suggested wording, unbuilt: extend the guard to cover any statement about what is or is
+not available, not just booking read-backs.
+
+## 🔴 NEW DEFECT 5 — the barge-in dataset is contaminated, and the headline number is wrong
+
+Run 3 excluded one 9.9 ms sample as a coincident stop. Run 4 produced a 67.4 ms sample of
+the same kind. That prompted a cross-check of **every** barge-in sample ever logged,
+against whether the assistant's text was actually truncated at the interruption point —
+truncation being the independent evidence that playout really was cut off.
+
+| Log | Samples logged | Corroborated by truncation |
+|---|---|---|
+| `agent_measured.log` (run 2) | 4 | **1** |
+| `agent_run3.log` | 4 | **1** |
+| `agent_run4.log` | 9 | **2** |
+| **Total** | **17** | **4** |
+
+**Only 4 of 17 logged "barge-ins" show truncated assistant speech.** The other 13 show a
+complete sentence ending in terminal punctuation — the agent finished on its own and the
+caller happened to start talking around the same moment.
+
+| | n | range | median |
+|---|---|---|---|
+| As previously claimed | 17 | 10–1100 ms | 751 ms |
+| Truncation-corroborated only | **4** | **502–1100 ms** | **900 ms** |
+
+**The 349 ms figure is almost certainly not a barge-in.** Both 349 ms samples (run 2 and
+run 4) show complete assistant sentences. That number has been in the README and in the
+claimable-evidence list since 2026-07-27, and it is the fastest figure in the set — which
+is exactly why it was worth checking and why the README's existing "do not quote a
+sub-500 ms figure" caution turns out to have been righter than it knew.
+
+Run 2's writeup said the discrimination "works; it is not labelling every stop a
+barge-in." That was over-confident. It catches the easy case — a stop with no user onset
+at all — and misses the coincident one entirely.
+
+**Honest limitation on this correction too.** Truncation is a heuristic, not ground truth:
+a genuine barge-in landing on the last word of a sentence would look complete and be
+misclassified here. So **n=4 is a lower bound on real barge-ins**, and the true figure sits
+somewhere between the two rows above. What is now certain is that the n=17 row is wrong.
+
+**A latency floor is not the fix.** It would catch 9.9 ms and 67.4 ms and nothing else —
+the coincident stops at 349, 751, 802 and 904 ms are indistinguishable from real ones by
+duration alone. The fix is to correlate the stop against whether playout was actually
+truncated, which is the signal already sitting in the log. Unbuilt.
+
+## Not reached, again
+
+Steps 8 (double-fire), 9 (uninterruptible write), 10 (`capture_lead`) and 5 (the cough).
+Four runs, still never executed on live audio. The cough is 0 for 4.
+
+---
+
+# Fixes applied — 2026-07-28, after run 4
+
+All four verified by test; **none verified on live audio yet.** Run 5 is the gate.
+Suite: **82 -> 104 tests**, `ruff check` and `ruff format --check` clean.
+
+## Defect 4 — availability overclaim: guard extended
+
+`BASE_INSTRUCTIONS` gains an availability clause: describe exactly the times
+`check_availability` returned, never call a time the only / last / closest one unless the
+result shows that, and when asked about part of a day, name every slot in that range.
+
+Same probabilistic caveat as defect 1 — it is a prompt, not a schema. A2 and A1 of the
+run-5 script test it.
+
+## Defect 5 — barge-in measurement: stopped inferring
+
+New `src/voice_agent/instrumentation.py`, replacing the inline `_instrument_barge_in` in
+`agent.py`. Three versions of one measurement, and the module docstring keeps all three
+because the failure mode repeated:
+
+| | Method | Why it failed |
+|---|---|---|
+| v1 | Infer from log ordering | Measured the logger, not the agent — a constant 2–5 ms offset across three different configs |
+| v2 | `user_state` onset → `agent_state` leaves speaking | Real, but *any* stop after a user onset counted. 13 of 17 were coincidences |
+| v3 | Ask `SpeechHandle.interrupted` | The framework's own answer to "was playout cut off" |
+
+Design decisions:
+
+- **The coincident overlap is kept, not deleted.** It moves to `user_overlap_ms`. It is
+  real data about how often a caller lands on the agent's last word; it was only ever
+  wrong as a *latency* figure.
+- **Unknown is reported as unknown.** If the handle cannot be observed,
+  `playout_interrupted` is `null` and no latency is claimed. Unknown never becomes a claim.
+- **Implausible overlaps are flagged, not dropped.** Under 100 ms on a genuine
+  interruption sets `implausible: true`, so nobody has to rediscover why the minimum looks
+  impossible.
+
+**`agent_false_interruption` is now logged.** Step 5 — cough / non-speech rejection — was
+scored "not observed" across four runs. The event fires; run 3's log carries
+`resumed false interrupted speech`. Nothing was listening for it. **It was never
+unobservable, only unobserved**, and four runs of manual retries could never have fixed
+that. Worth remembering the next time a manual step refuses to produce evidence: check
+that something is listening before concluding nothing happened.
+
+Tests: 10 in `tests/test_instrumentation.py`. Two drive a real `AgentSession` through the
+offline harness to prove `SpeechHandle.interrupted` is trustworthy under LiveKit's own
+control path; the rest map that signal to log records. Recorded there and here: offline,
+`agent_state_changed` never reaches "speaking" — the agent state machine needs room IO —
+so the event path cannot be integration-tested without a room. That is a limitation of the
+test, stated rather than hidden.
+
+## Transcript PII — content dropped, shape kept
+
+Masking tool arguments closed the structured leak. Run 4 still logged "John Doe" four
+times through `received user transcript` and `conversation_item_added`, on a call whose
+arguments were fully masked.
+
+`TranscriptRedactor` replaces spoken content with its word count — `[9 words redacted]` —
+and leaves every timing field intact, so turn and latency analysis still work on a redacted
+log. Assistant text is redacted too, because the agent echoes caller PII when it reads a
+number back. This is only safe because barge-in detection no longer depends on reading
+assistant text out of the log; under the old instrumentation it would have broken the
+measurement.
+
+`LOG_TRANSCRIPTS=1` opts back in for an acceptance run, and the session start line states
+which mode is active so a log can never be mistaken for the other one.
+
+**Honest scope.** This is content-dropping, not PII detection. Nothing here identifies
+*which* words were sensitive — it declines to log any of them. That is the right default
+for a shipped deployment and a nuisance during acceptance work, which is what the env var
+is for. A real NER-based redactor would be a different and much larger artifact, and would
+bring its own false-negative problem.
+
+---
+
+# Run 5 — 2026-07-28, 15:58–16:02 EDT (fix verification)
+
+Log: `logs/agent_run5a.log` · Recording: `~/Desktop/Screen Recording 2026-07-28 at 3.57.53 PM.mov` (353 MB)
+`LOG_TRANSCRIPTS=1`. Session B was **not run** — see "Outstanding".
+
+## ✅ Defect 1 — closed, with the ordering run 4 missed
+
+The caller stated the preference **first**, in the opening request: *"I want to book a
+dental appointment. With a female doctor on Friday, ten thirty AM."* That is the exact
+shape of the run-3 bug, and it held at both ends:
+
+| | |
+|---|---|
+| First response | *"…please note **I can't guarantee a specific doctor**, but I will pass along your preference for a female doctor."* |
+| Booking confirmation | *"Your dental appointment is booked for 1:00 PM on Friday."* — time only |
+
+Run 3 said *"set for 1 PM tomorrow with a female doctor."* Run 5 did not, with the
+preference in context from the first sentence. **Defect 1 is closed.**
+
+## ✅ Defect 4 — closed
+
+> *"On Friday, we have openings at **9:00, 10:00, 13:00, and 15:00**. We don't have 10:30 available."*
+
+All four slots named. Run 4's failure was *"there is only a slot at three PM in the
+afternoon"* with 13:00 open. Held twice more under pressure: *"We have 13:00 available, but
+not 13:30"* and *"We have 10:00 and 13:00, but not 12:00"* — naming alternatives without
+asserting exclusivity. **Defect 4 is closed.**
+
+## 🔴 Defect 5 — the fix was WRONG in the opposite direction
+
+17 stops: **2 interrupted, 15 not.**
+
+| Time | interrupted | barge_in_latency_ms | user_overlap_ms |
+|---|---|---|---|
+| 15:59:05 | **true** | **699.1** | — |
+| 15:58:57 | false | null | 1299.2 |
+| 15:59:15 | false | null | 999.0 |
+| 15:59:31 | false | null | 948.5 |
+| 15:59:42 | false | null | 3594.7 |
+| 15:59:58 | false | null | 1098.7 |
+| 16:01:29 | false | null | 1374.5 |
+| 16:01:46 | false | null | 950.6 |
+| 16:02:07 | false | null | 373.0 |
+| 16:02:23 | true | null | — |
+
+**Eight stops carried an overlap that the old instrumentation would have reported as a
+barge-in.** Every one now sits in `user_overlap_ms` with a null latency. The ratio matches
+the 13-of-17 historical cross-check, from an independent run.
+
+The 16:02:23 row is worth reading: interrupted, but no user onset preceded it — the session
+closed mid-word (*"You're welcome. Take"*). Interrupted with no latency claimed is the
+correct output, and under v2 it would have been silently dropped instead.
+
+### …and then Jean said "barge-in doesn't seem to work as before"
+
+He was right, and the log proves it. Cross-checking the same run against the independent
+tell — whether the assistant's own text was cut off mid-sentence:
+
+| | count |
+|---|---|
+| Assistant utterances truncated mid-sentence | **6** |
+| Reported by v3 as interrupted | **2** |
+
+**Four real barge-ins were reported as coincidental stops.** v2 over-counted; v3
+under-counted. Both looked right until real-call data was checked against something
+outside the instrument.
+
+**Root cause.** v3 read `session.current_speech` when the agent began speaking and asked
+that handle whether it was interrupted. `current_speech` is not reliably the utterance
+that just ended: preemptive generation — which this log shows on nearly every turn —
+queues the next speech while the current one is still playing, and the agent state does
+not dip to "listening" between two queued utterances. So the captured handle can belong
+to a different utterance by the time the stop arrives, and a fresh handle reports
+`interrupted == False`.
+
+**v4, applied.** Use the per-utterance record instead of a mutable session pointer.
+`agent_activity.py` builds each assistant `ChatMessage` with
+`interrupted=speech_handle.interrupted`, taken from the exact handle that produced it, and
+emits `conversation_item_added` **synchronously, immediately before** flipping the state to
+"listening" (`agent_activity.py:2836-2839`). The item that arrives just before a stop is
+therefore the utterance that is ending. The handle survives as a fallback for stops with no
+preceding item; the item wins whenever present.
+
+Four new regression tests, including one that reproduces the v3 bug directly: a stale
+handle saying "not interrupted" must lose to an item saying it was.
+
+**The transferable lesson.** Three of four versions of this measurement were wrong, and
+each was discovered the same way — by checking the instrument against a signal from
+outside it. A measurement that only agrees with itself is not evidence. **Do not quote a
+barge-in figure from this project until it has been cross-checked against a run's
+transcripts.**
+
+**No latency figure survives run 5.** n=1 under v3, and v3 is now known to be broken. v4
+has not run live at all. There is currently no defensible barge-in number, which remains
+the correct state.
+
+## 🔴 NEW DEFECT 6 — the read-back did not match the write, and no explicit yes was given
+
+The instruction is unambiguous: *"Before booking, read the caller's phone number back to
+them digit by digit and get an explicit yes. A wrong number makes the booking worthless."*
+
+| Time | |
+|---|---|
+| 16:01:03 | agent: *"…area code 5, 5, 5 then 5, 5, 5, then 5, 5, 5, 5 — is that right? **And your full name is still John?**"* |
+| 16:01:06 | caller: *"My name is Jean Doe."* |
+| 16:01:08 | `book_appointment` fires |
+
+Two failures in three lines:
+
+1. **The digits written do not match the digits read back.** The read-back is ten digits.
+   The logged mask is `*******5555` — **eleven**. (The earlier rejected attempt masks to
+   `****5555`, eight, matching the agent's own *"that's eight digits"*, so the mask
+   arithmetic is sound.)
+2. **No explicit yes was obtained.** The agent asked two questions in one breath — number
+   *and* name — the caller answered only the name, and the agent treated that as
+   confirmation of both and wrote immediately.
+
+This is worse than defects 1 and 4, because it is a failure *of the safety mechanism
+itself*. The read-back exists to catch a wrong number; here it neither matched the write
+nor waited for agreement. A booking with an eleven-digit callback number is exactly the
+"worthless booking" the instruction names.
+
+Candidate fixes, unbuilt:
+
+- **Never bundle the confirmation question with another question.** One question, one
+  answer, then write.
+- **Echo the digit count and require it to match** what the tool receives — cheap, and it
+  would have caught the 10-vs-11 discrepancy deterministically rather than by prompt.
+- The second is the stronger fix: it does not depend on the model behaving.
+
+## ⚠️ Cough test — now observable, still unresolved
+
+`agent_false_interruption` is instrumented and **zero events were logged.** That is now a
+real answer rather than a blind spot: either no non-speech noise was attempted this run, or
+one was and it did not trip. Five runs in, the honest score remains "not observed" — but
+for the first time the instrument is listening.
+
+## Outstanding
+
+| Item | Status |
+|---|---|
+| **Session B — transcript redaction proof** | **Not run.** The feature is unverified live. |
+| Step 8 — double-fire | Never run, five runs |
+| Step 9 — uninterruptible write | Never run, five runs |
+| Step 10 — `capture_lead` | Never run, five runs |
+| Barge-in figure | n=1 under the new instrumentation |
+
+
+---
+
+# Run 5, session 2 — 2026-07-28, 16:12–16:14 EDT (v4 live)
+
+Same log (`agent_run5a.log`, room `console-f3c14640`), same process, second console session.
+Recording: `~/Desktop/Screen Recording 2026-07-28 at 4.12.12 PM.mov` (213 MB).
+
+**It did run v4.** `instrumentation.py` was written at 16:07:54; the job process (pid 80928)
+initialised at 16:12:15; LiveKit uses `spawn` on macOS, so the child re-imported from disk.
+
+## Defects 1 and 4 held again
+
+- *"We have openings on Friday at 9 AM, 10 AM, 1 PM, and 3 PM."* — all four named.
+- *"Twelve thirty is not an option we have available on Friday."* — refused to invent, sixth run.
+- *"Your dental appointment is booked for 10 AM on Friday."* — time only.
+- *"I can't guarantee a female doctor or wheelchair accessibility right now, but I will pass
+  your request along."* — both requests, one sentence, no promise.
+- Unprompted generalisation: asked to arrange **food**, it answered *"Food can't be arranged
+  through the appointment, but I will let the team know."* The guard is holding on a category
+  nobody wrote it for.
+
+## Defect 6 did NOT recur — and that is not the same as fixed
+
+> *"To confirm, your phone number is 5 5 5 5 5 5 5 5 5 5, correct?"* — *"Yeah. That's right."*
+
+One question, explicit yes, then the write. Logged mask `******5555` = **10 digits**, matching
+the read-back exactly. **No fix has been applied.** Run 5 session 1 bundled two questions and
+wrote 11 digits against a 10-digit read-back; session 2 did neither. That is an intermittent
+defect, which is harder to trust than a consistent one, and it stays open.
+
+## Defect 5 — v4 was better and still wrong
+
+| | session 1 (v3) | session 2 (v4) |
+|---|---|---|
+| Utterances truncated mid-sentence | 6 | 2 |
+| Reported interrupted | 2 | 1 |
+
+The two session-2 cases show the cause exactly:
+
+```
+16:12:42  assistant item (truncated)  ->  stop: interrupted=True     correct
+16:12:25  stop: interrupted=False     ->  assistant item (truncated) MISSED
+```
+
+v4 assumed the item always arrives before the stop. It does on the generation path
+(`agent_activity.py:2836-2839`) and not on the `generate_reply` path used for the greeting.
+When the stop came first there was nothing to read, so v4 fell back to the stale handle and
+inherited v3's bug.
+
+### v5 — applied
+
+Stop assuming an order. The stop carries the *timing*, the item carries the *verdict*; each
+is stashed as half a record and emitted once both are in hand, whichever lands first. A stop
+still unpaired when the next utterance begins is emitted as `unpaired: true` rather than
+dropped — silent loss is the failure this module exists to stop repeating.
+
+**And the cross-check now ships inside the record.** `text_truncated` — did the assistant's
+own text stop mid-sentence — is the independent tell that caught v2, v3 and v4, every time by
+hand and after the fact. When it disagrees with `playout_interrupted`, the record carries
+`signals_disagree: true`:
+
+```json
+{"event": "agent_stopped_speaking", "playout_interrupted": false,
+ "barge_in_latency_ms": null, "user_overlap_ms": 0.0,
+ "text_truncated": true, "signals_disagree": true}
+```
+
+Every earlier version of this measurement would have been caught in one run by that field.
+
+**Five versions, three wrong.** v1 measured the logger. v2 counted coincidences. v4 counted
+one path. Each looked correct until checked against something outside itself. The honest
+summary is not "v5 is right" — it is that **v5 is the first version that reports when it
+might be wrong.** Still zero live-verified samples.
+
+## Still never run, six runs in
+
+Steps 8 (double-fire), 9 (uninterruptible write), 10 (`capture_lead`), the cough, and
+session B (the transcript-redaction proof — both sessions ran with `LOG_TRANSCRIPTS=1`).
+
+---
+
+# Run 5, session 3 — 2026-07-28, 16:35–16:37 EDT (v5 live, first time)
+
+Room `console-79927579`. Recording: `~/Desktop/Screen Recording 2026-07-28 at 4.34.45 PM.mov` (172 MB).
+
+## v5 worked — and immediately found something none of v1–v4 could have
+
+9 stops. **Zero truncated utterances** — every assistant line ends in terminal punctuation.
+Two stops carry `playout_interrupted: true`. So the two signals disagree twice, and the
+record says so:
+
+| # | text | int | trunc | barge_ms | flag |
+|---|---|---|---|---|---|
+| 2 | *"…Would you like to pick any of these?"* | true | false | 399.7 | `signals_disagree` |
+| 3 | *"…you want the appointment at ten AM on Thursday, July 30, 2026?"* | true | false | — | `signals_disagree` |
+
+In both, the caller answered **as the agent landed its final word** — *"Alright. That's"*
+and *"Yeah."* The framework issued an interrupt; the agent had already said everything it
+meant to say.
+
+**Neither signal is wrong. They answer different questions.**
+
+- `SpeechHandle.interrupted` = an interrupt was *issued*.
+- `text_truncated` = words were actually *lost*.
+
+### The real finding: "barge-in" was never defined
+
+Five versions of this instrument argued about *mechanism*. None of them established what
+the thing being measured **is**. Three defensible definitions, and they give different
+numbers from the same call:
+
+| Definition | Session 3 samples |
+|---|---|
+| (a) An interrupt was issued | **2** (399.7 ms, and one with no measurable onset) |
+| (b) Speech was actually cut off | **0** |
+| (c) Both agree | **0** |
+
+Under (a) this call produced a 399.7 ms figure. Under (b) or (c) it produced none. That
+gap is not noise — a caller answering on the agent's last syllable is a different event
+from a caller cutting it off mid-word, and only one of them is what "the agent yields fast
+when you talk over it" claims.
+
+**This is why v5 was worth building even though it produced no number.** v1–v4 would each
+have silently picked a side. This one asked.
+
+**Recommendation: definition (c) for anything quoted, (a) retained in the log.** A figure
+you can defend to a client is one where two independent signals agree. Keep the issued-
+interrupt count as a separate, honestly-named statistic.
+
+## Everything else held
+
+- **Defect 4**, fourth run: *"We don't have eleven AM available on Thursday, but we have
+  slots at nine AM, ten AM, one PM, and three PM."*
+- **Defect 1**, fourth run: *"I can't guarantee those details on this call, but I will pass
+  your request along."* Booking confirmation named the time only.
+- **Date anchoring**, seventh run: "Thursday" → 2026-07-30.
+- **Defect 6 did not recur.** Read-back *"five five five, five five five, five five five,
+  five five"* = 11 digits; logged mask `*******5555` = 11 digits; explicit *"Yep."* before
+  the write. **2 of 3 sessions correct, 1 wrong. Intermittent, unfixed, still open.**
+
+## Still never run — seven calls in
+
+Steps 8 (double-fire), 9 (uninterruptible write), 10 (`capture_lead`); the cough test
+(five runs, zero `agent_false_interruption` events); and session B, the transcript-redaction
+proof — every session so far has run with `LOG_TRANSCRIPTS=1`.
+
+**No deliberate mid-word barge-in has been performed since v5 shipped**, so definition (b)
+and (c) still have zero samples by construction rather than by measurement.
+
+---
+
+# Run 7 — 2026-07-28, 16:52–16:58 EDT (the gate)
+
+Logs: `agent_run7a.log` (session A), `agent_run7b.log` (session B).
+Recording on the Desktop. Definition (c) live: a barge-in counts only when the framework
+issued an interrupt **and** the agent's words were actually cut off.
+
+## ✅ THE BARGE-IN FIGURE — first defensible dataset
+
+| # | ms |
+|---|---|
+| 1 | 449.2 |
+| 2 | 549.3 |
+| 3 | 652.8 |
+| 4 | 1199.5 |
+| 5 | 1200.2 |
+
+**n=5 · min 449 · median 653 · max 1200 · mean 810.** Every sample has
+`playout_interrupted: true` **and** `text_truncated: true`.
+
+A sixth stop (16:53:44) was a confirmed interruption with no measurable user onset, so it
+reports no latency rather than an invented one. One stop (16:53:09) carries
+`signals_disagree` — an interrupt issued on a sentence that completed — and is correctly
+excluded. Under the old instrumentation that would have entered the dataset as a 344 ms
+barge-in, and it would have been the second-fastest number on record.
+
+**The distribution is not tight.** Three samples cluster 449–653 ms and two sit at
+~1200 ms. n=5, one caller, one mic, one region. Quote it as *"the agent yields inside
+about a second, typically around 650 ms"* and nothing finer.
+
+## ✅ Cough / false-positive rejection — RESOLVED after six runs
+
+```
+16:55:43  {"event": "agent_false_interruption", "resumed": true}
+```
+
+Six runs scored this "not observed." The event fired the moment something was listening
+for it. **It was never unobservable, only unobserved** — and no amount of coughing harder
+would have changed that. The instrument was the problem, not the acoustics.
+
+## ✅ `capture_lead` — first live execution, eight runs in
+
+`16:57:00 capture_lead ok att=1 phone=******0142`, after a read-back the caller confirmed.
+Covered by unit tests since day one; now covered by a call.
+
+## ✅ Transcript redaction — PROVEN, fourth time of asking
+
+Session B startup: `transcript logging: redacted`. Zero occurrences of the caller's name.
+Every transcript line reduced to a word count:
+
+```
+"user_transcript": "[4 words redacted]"    "text": "[15 words redacted]"
+```
+
+No digit run over six characters appears anywhere in the file. This is the check that
+separates a redaction feature from a redaction claim, and it passes.
+
+## ✅ Defects 1, 4 and 6 all held
+
+- **4:** *"Tomorrow afternoon, we have two times at 1 PM and 3 PM."*
+- **1:** *"I can book for 1 PM tomorrow, but I can't guarantee a female doctor. I'll pass
+  your preference along."* Confirmation named the time and the name, nothing invented.
+- **6:** two read-backs, two matches. `3 0 5 5 5 5 5 5 5 5` read back → 10 digits written;
+  `3 0 5 5 5 5 0 1 4 2` read back → 10 digits written. The structural check never had to
+  refuse, because nothing tried to write a mismatch.
+- **Invalid phone:** nine digits → `value_error` → *"the phone number you gave doesn't have
+  enough digits for our system."* No bluff, no invented digits.
+
+## 🔴 NEW — `capture_lead` writes a phone number with no read-back check
+
+`book_appointment` refuses to write unless the agent's own read-back matches. `capture_lead`
+takes `caller_name` and `phone` and has **no such check.** It happened to read back
+correctly in run 7; nothing enforces it.
+
+A wrong number in a lead is less costly than a wrong number on a booking, but the argument
+for the check does not actually depend on which table the row lands in. The asymmetry is an
+oversight, not a decision. **Unfixed.**
+
+## 🔴 NEW — the agent recites full phone numbers in closing statements
+
+> *"All set for 1 PM tomorrow for John Doe, phone number 3 0 5 5 5 5 5 5 5 5."*
+> *"Someone will call you back at 3 0 5 5 5 5 0 1 4 2 soon."*
+
+Read-back before a write is deliberate and valuable. Reciting the number again *after* the
+write is neither, and on a real call it is spoken aloud into whatever room the caller is
+standing in. A one-line instruction change. **Unfixed.**
+
+## ⚠️ Steps 8 and 9 — still not exercised, for an interesting reason
+
+Asked to book the same slot twice, the agent **did not attempt the duplicate write.** It
+called `check_availability`, saw 1 PM was gone, and offered the remaining slots:
+
+> *"The 1 PM slot tomorrow is now booked, but 9 AM, 10 AM, and 3 PM are still available."*
+
+That is better behaviour than the test expected — and it means the `once_per_turn` ledger
+and the calendar's conflict guard have **still never fired on a live call.** Both remain
+unit-tested only. Step 9 (a barge-in during a write) likewise never occurred, because no
+write was in flight when the caller talked over it.
+
+Forcing these would mean scripting the model into a mistake it is now avoiding. **Recorded
+as untested rather than chased.**
+
+## ⚠️ The deliberate defect-6 probe was not performed
+
+The script asked for a confirmation answered with a *different* question, to test whether
+the agent writes without agreement. The caller confirmed properly both times. The structural
+check verifies the digits match; **nothing yet verifies the caller said yes.** Open.

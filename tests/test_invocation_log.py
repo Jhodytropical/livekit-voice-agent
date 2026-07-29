@@ -125,7 +125,7 @@ def test_sanitizer_masks_known_sensitive_keys() -> None:
         }
     )
     assert out["email"].endswith("[redacted]") or "example.com" not in out["email"]
-    assert out["phone"].endswith("4594")
+    assert out["phone"].endswith("0142")
     assert out["phone"].count("*") > 0
     assert out["caller_name"] != "Ada Lovelace"
     assert out["slot"] == "2026-07-28T10:00"

@@ -44,10 +44,40 @@ BOOK_ARGS = {
 }
 
 
-def _agent() -> tuple[AppointmentAgent, DemoCalendar, DemoCrm]:
+#: book_appointment refuses to write unless the agent's own recent speech contains a
+#: matching read-back (see readback.py, run 5 defect 6). These tests are about turn and
+#: idempotency behaviour, so they stand in a correct read-back and let that check pass.
+READBACK = "To confirm, three oh five, five five five, oh one four two — is that right?"
+
+
+def _agent(*, readback: str | None = READBACK) -> tuple[AppointmentAgent, DemoCalendar, DemoCrm]:
     calendar, crm = DemoCalendar(), DemoCrm()
     runtime = build_appointment_runtime(calendar=calendar, crm=crm)
-    return AppointmentAgent(runtime=runtime), calendar, crm
+    agent = AppointmentAgent(runtime=runtime)
+    agent._recent_assistant_messages = lambda: [readback] if readback else []  # type: ignore[method-assign]
+    return agent, calendar, crm
+
+
+@pytest.mark.asyncio
+async def test_a_booking_without_a_readback_is_refused() -> None:
+    """The structural half of defect 6: no read-back, no write."""
+    agent, calendar, _ = _agent(readback=None)
+
+    with pytest.raises(ToolError, match="read the phone number back"):
+        await agent.book_appointment(_FakeRunContext(), **BOOK_ARGS)
+
+    assert calendar.booking_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_booking_that_contradicts_the_readback_is_refused() -> None:
+    """Ten digits read back, eleven written — run 5, session 1, verbatim."""
+    agent, calendar, _ = _agent(readback="To confirm: 5 5 5 5 5 5 5 5 5 5, correct?")
+
+    with pytest.raises(ToolError, match="does not match"):
+        await agent.book_appointment(_FakeRunContext(), **{**BOOK_ARGS, "phone": "55555555555"})
+
+    assert calendar.booking_count == 0
 
 
 def test_agent_exposes_exactly_the_three_niche_tools() -> None:

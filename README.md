@@ -21,12 +21,12 @@ Built against **`livekit-agents==1.6.7`** (released 2026-07-25) on Python 3.12.8
 
 | | |
 |---|---|
-| Tool runtime | Built, 68 automated tests passing |
+| Tool runtime | Built, 132 automated tests passing |
 | Live browser call | **Run — 2026-07-27.** Four sessions against LiveKit Cloud, real audio both directions |
 | Refusal to invent availability | **Verified live**, under pressure. See [Live findings](#live-findings-2026-07-27) |
 | Date handling | **Bug found live and fixed.** See [Live findings](#live-findings-2026-07-27) |
 | Barge-in — does it interrupt? | **Verified live.** Speech truncates mid-phrase, caller's words survive intact, agent answers the interruption |
-| Barge-in — *how fast*, in ms | **Measured live 2026-07-27:** n=4, **349–1000 ms, median 900 ms** (`min_words=2`). See [Measured barge-in latency](#measured-barge-in-latency-2026-07-27-live-call) |
+| Barge-in — *how fast*, in ms | **n=5, 449–1200 ms, median 653 ms.** Every sample confirmed by two independent signals — see [Measured barge-in latency](#measured-barge-in-latency-live-calls) |
 | Recorded demo call | Screen recording captured; not yet cut |
 
 Nothing in this README claims a working cloud session it didn't have. Every
@@ -338,35 +338,56 @@ Every value is set explicitly, including ones matching the framework default. On
 a receptionist call the defaults are not self-evidently right, and an inherited
 default is invisible in code review.
 
-### Measured barge-in latency (2026-07-27, live call)
+### Measured barge-in latency (live calls)
 
-VAD onset to playout stop, taken from `_instrument_barge_in()` — not inferred from
-log ordering. Shipping config: `min_words=2`, `min_duration=0.4`.
+VAD onset to playout stop. Shipping config: `min_words=2`, `min_duration=0.4`.
+A stop counts as a barge-in only when **both** independent signals agree: the framework
+issued an interrupt (`SpeechHandle.interrupted`, stamped on the utterance's own message)
+**and** the agent's speech was actually cut off mid-sentence.
 
-| # | Latency |
+| # | ms |
 |---|---|
-| 1 | **349 ms** |
-| 2 | **849 ms** |
-| 3 | **951 ms** |
-| 4 | **1000 ms** |
+| 1 | **449** |
+| 2 | **549** |
+| 3 | **653** |
+| 4 | **1200** |
+| 5 | **1200** |
 
-**n=4 · min 349 ms · median 900 ms · max 1000 ms.**
+**n=5 · min 449 · median 653 · max 1200 · mean 810.** Measured 2026-07-28, run 7.
 
-**What this does and does not support.** One session, one caller, one audio path
-(MacBook built-in mic, consumer broadband, US East region). Four data points is
-enough to state an order of magnitude and nothing finer. **Do not quote a sub-500 ms
-figure from this** — 349 ms happened once and the median is roughly triple it.
+**Do not quote a sub-450 ms figure, and do not quote the median as a ceiling.** Three
+samples cluster 449–653 ms and two sit at ~1200 ms. The honest sentence is: *the agent
+yields inside about a second, typically around 650 ms.*
 
-The honest summary is: *the agent yields inside a second, usually around 900 ms.*
+**Why it took five attempts to measure this.** Earlier versions of the instrument produced
+349 ms, then 502–1100 ms, then nothing at all. Each was wrong in a different direction:
 
-**Why the spread, and why it is not noise.** With `min_words=2` the interruption
-cannot fire until speech-to-text has emitted two words, so latency tracks how long
-the caller talks before the transcript finalises — not a fixed timer. The 349 ms case
-was a fast two-word cut-in; the ~950 ms cases were longer phrases. That means the
-tunable is not really a delay knob:
+| | Method | Failure |
+|---|---|---|
+| v1 | Infer from log ordering | Measured the logger, not the agent |
+| v2 | Any stop after a user onset | Counted coincidences — 13 of 17 |
+| v3 | Ask `session.current_speech` | Under-counted — 6 utterances cut, 2 reported |
+| v4 | Read the assistant item's flag | Right on one code path, blind on the other |
+| v5 | Pair the stop with its own item; require both signals | Current |
 
-- `min_words ≥ 1` → gated on STT finalising. Variable, roughly 350–1000 ms observed.
-  Immune to coughs, because a cough produces no words.
+Every one was caught the same way — by checking the instrument against whether the
+assistant's text actually stopped mid-sentence. **That check now ships in the record** as
+`text_truncated`, and a stop whose two signals disagree carries `signals_disagree: true`
+and contributes no latency. Run 7 produced one such record: an interrupt issued on a
+sentence that had already finished, 344 ms. Under v2 it would have been the
+second-fastest number in the dataset.
+
+`interrupt_issued` retains the looser count for anyone who wants it, named for what it is.
+
+**Why the spread.** With `min_words=2` the interruption cannot fire until speech-to-text
+has emitted two words, so latency tracks how long the caller talks before the transcript
+finalises rather than a fixed timer. That is consistent with the bimodal shape above:
+short cut-ins finalise fast, longer ones do not.
+
+- `min_words ≥ 1` → gated on STT finalising. Variable, 449–1200 ms measured.
+  Immune to coughs, because a cough produces no words — **verified live 2026-07-28**,
+  `agent_false_interruption resumed:true`, after six runs in which nothing was listening
+  for the event.
 - `min_words = 0` → gated on VAD alone, so `min_duration` becomes the only floor.
   Should be more consistent, at the cost of yielding to any noise longer than
   `min_duration`. **Not measured** — see [Blocked](#blocked--not-verified).
@@ -613,10 +634,13 @@ Every command below was run in this repo. Output is verbatim.
 
 ```
 $ ./.venv/bin/python -m pytest -q
-68 passed in 6.32s
+68 passed in 6.32s        # 2026-07-27, macOS, project .venv
 
 $ ./.venv/bin/ruff check src tests scripts
 All checks passed!
+
+$ python3 -m pytest -q   # 2026-07-28, Linux, livekit-agents 1.6.7, after the run-3 fixes
+82 passed in 8.18s
 
 $ ./.venv/bin/ruff format --check src tests scripts
 26 files already formatted
@@ -718,39 +742,79 @@ Redis, database, frontend, deployment.
 
 Honest list. None of these are hidden elsewhere in this README.
 
-1. **Barge-in latency beyond one audio path.** Measured at 349–1000 ms, median
-   900 ms, but from **n=4 on a single session, single mic, single region**. Nothing
+1. **Barge-in latency is measured on a contaminated dataset.** 13 of 17 logged samples
+   are coincident stops rather than interruptions. The corroborated figure is
+   **502–1100 ms, median 900 ms, n=4**, single mic, single region, and n=4 is a lower
+   bound because the corroboration is itself a heuristic. Nothing
    here characterises a phone call, a headset, or a noisy room. Treat the number as
    an order of magnitude.
 2. **`min_words=0` never measured.** The claim that VAD-only gating gives more
    consistent latency is reasoning, not data. It is a one-call experiment and it has
    not been run.
-3. **False-positive rejection (cough, "mm-hm") not observed.** Attempted twice across
-   two sessions; no corresponding event reached the log either time, so it is scored
-   neither pass nor fail.
-4. **Booking not completed end to end on a live call.** `check_availability` ran live
-   and correctly, and the agent asked for a phone number with a read-back promise —
-   but no `book_appointment` call has ever executed live. Covered by automated tests
-   only. Steps 7–11 of the manual script remain unrun.
-5. **No recorded demo cut.** Screen recordings of live calls exist; none has been
+3. ~~**False-positive rejection not observed.**~~ **Verified 2026-07-28.** Six runs
+   scored it "not observed"; the seventh logged
+   `{"event": "agent_false_interruption", "resumed": true}`. Nothing had been listening
+   for the event. The instrument was the gap, not the acoustics.
+4. **The agent can confirm a constraint it never recorded.** On 2026-07-28 a caller
+   asked for a female doctor; the agent acknowledged it, booked, and then confirmed
+   *"set for 1 PM tomorrow with a female doctor."* Nothing captured that preference —
+   `BookAppointmentArgs` has `extra="forbid"`, so the model could not have passed it.
+   The schema held; the *spoken confirmation* did not. This is a silent failure — the
+   caller hangs up satisfied and the booking does not match the promise. **Mitigated in
+   the prompt the same day** and **verified live in run 4**: the booking confirmation
+   named only the time, and two unrecordable requests (a female doctor, wheelchair access)
+   both drew *"I can't guarantee it on this call."* One residual gap — in run 4 both
+   requests came *after* the booking, so the exact run-3 ordering (preference stated
+   *before* the confirmation) is still unproven. Strong evidence, not a closed regression.
+   See `docs/acceptance-findings.md`, runs 3 and 4, defect 1.
+5. **Raw caller PII reaches the log file, despite the sanitizer.** `sanitize_args`
+   masks correctly and is verified against a real name — but LiveKit's own
+   `DEBUG livekit.agents - executing tool` line writes the unredacted arguments to the
+   same file 2 ms earlier. The guarantee in `sanitize.py`'s docstring holds for this
+   project's log lines and not for the log as a whole. **Fixed 2026-07-28**:
+   `src/voice_agent/log_redaction.py` puts the same `sanitize_args` in front of the
+   framework's logger via a fail-closed `logging.Filter`, so the guarantee no longer
+   depends on which CLI verb was typed. Verified by replaying the exact leaked payload;
+   14 regression tests.
+6. **The double-fire ledger and the uninterruptible write have never fired live.**
+   Asked to book the same slot twice, the agent called `check_availability` first, saw
+   the slot was gone, and offered alternatives — better behaviour than the test expected,
+   and it means `once_per_turn` and the calendar's conflict guard remain unit-tested only.
+   Forcing them would mean scripting the model into a mistake it now avoids.
+   `capture_lead` **has** run live (2026-07-28).
+7. **`capture_lead` writes a phone number with no read-back check.** `book_appointment`
+   refuses to write unless the agent's own read-back matches; `capture_lead` has no
+   equivalent. An oversight, not a decision. **Unfixed.**
+8. **The agent recites full phone numbers after the write** — *"Someone will call you
+   back at 3 0 5 5 5 5 0 1 4 2."* Read-back before a write is deliberate; repeating the
+   number afterwards is spoken into whatever room the caller is in. **Unfixed.**
+9. **Nothing verifies the caller said yes.** The read-back check confirms the digits
+   match what was spoken; it cannot tell agreement from a change of subject.
+10. **No recorded demo cut.** Screen recordings of live calls exist; none has been
    edited into a demo.
-6. **No Vapi-vs-LiveKit barge-in comparison.** Needs both stacks on a live call.
-7. **LiveKit audio turn detector not exercised.** `turn_detection="vad"` is what ships
+11. **No Vapi-vs-LiveKit barge-in comparison.** Needs both stacks on a live call.
+12. **LiveKit audio turn detector not exercised.** `turn_detection="vad"` is what ships
    and what is tested. `inference.TurnDetector()` needs LiveKit Inference credentials.
-8. **LiveKit's own test framework not used.** `session.run(user_input=…)` and the
+13. **LiveKit's own test framework not used.** `session.run(user_input=…)` and the
    `judge()` helpers require an LLM instance, so they need credentials. The tests here
    drive `AgentSession` directly instead.
 
 ### Next, in order
 
-1. Steps 7–11 of the manual script: complete a booking live, fire the double-fire
-   guard, capture a lead, check the logs for leaked PII. This is the biggest remaining
-   gap — the write path has never run against live audio.
-2. A deliberate cough/noise test that actually lands in the log, to settle
-   false-positive rejection one way or the other.
-3. `min_words=0` on one call, to test whether VAD-only gating is more consistent than
-   the 349–1000 ms spread STT gating produces.
-4. Cut a recorded call into a demo.
+1. **Correlate barge-in stops against playout truncation** so the latency figure stops
+   counting coincident stops. Highest-value fix: it is the number most likely to be quoted.
+2. **Extend the confirmation guard to availability statements.** Run 4 had the agent say
+   3 PM was the only afternoon slot while 1 PM was open — same overclaim family, not
+   covered by the current wording.
+3. **Run 5: state a preference *before* booking**, to close the one ordering the run-4
+   verification did not cover.
+4. Steps 8, 9 and 10 of the manual script: double-fire guard, uninterruptible write,
+   and `capture_lead` — none has run on live audio.
+5. A deliberate cough/noise test that actually lands in the log. Four attempts, four
+   no-shows.
+6. `min_words=0` on one call — but only after item 1, since the current spread is not
+   trustworthy enough to compare against.
+7. Cut a recorded call into a demo. Raw footage: run 3 and run 4 screen recordings.
 
 ---
 

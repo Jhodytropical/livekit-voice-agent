@@ -17,9 +17,7 @@ Sources:
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any
 
 from dotenv import load_dotenv
 from livekit import agents
@@ -28,6 +26,12 @@ from livekit.plugins import deepgram, openai, silero
 
 from voice_agent.appointment_agent import build_agent
 from voice_agent.config import Settings
+from voice_agent.instrumentation import instrument_barge_in
+from voice_agent.log_redaction import (
+    install_tool_argument_redaction,
+    install_transcript_redaction,
+    transcripts_enabled,
+)
 from voice_agent.turn_handling import build_silero_vad_kwargs, build_turn_handling
 
 # .env.local matches the LiveKit CLI convention; .env is the fallback. Neither is
@@ -36,6 +40,19 @@ load_dotenv(".env.local")
 load_dotenv()
 
 logger = logging.getLogger("voice_agent")
+
+# At import, not inside an entrypoint: every LiveKit job runs in its own process
+# that re-imports this module, and the framework can log a tool call before any
+# per-session setup would have run. Run 3 (2026-07-28) found raw caller PII in the
+# framework's own DEBUG line, two milliseconds ahead of the runtime's sanitized one.
+# See docs/acceptance-findings.md, run 3, defect 2.
+install_tool_argument_redaction()
+
+# Transcript content is dropped by default and kept only when LOG_TRANSCRIPTS is set
+# deliberately, for an acceptance run. Word counts and every timing field survive
+# either way. See log_redaction.py for why free-form speech gets a different
+# treatment from structured arguments.
+install_transcript_redaction()
 
 AGENT_NAME = "appointment-agent"
 
@@ -60,6 +77,11 @@ server = AgentServer(setup_fnc=prewarm)
 async def entrypoint(ctx: agents.JobContext) -> None:
     settings = Settings.from_env()
     logger.info("starting session: %s", settings.describe())
+    # Stated explicitly so a log can never be mistaken for the other mode.
+    logger.info(
+        "transcript logging: %s",
+        "ENABLED — this log will contain caller speech" if transcripts_enabled() else "redacted",
+    )
 
     # AgentSession is generic over the session userdata type. This agent keeps no
     # per-session state of its own — the tool runtime owns everything stateful —
@@ -76,80 +98,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         max_tool_steps=3,
     )
 
-    _instrument_barge_in(session)
+    instrument_barge_in(session)
 
     await session.start(room=ctx.room, agent=build_agent(settings))
     await session.generate_reply(instructions=GREETING)
-
-
-def _instrument_barge_in(session: AgentSession[None]) -> None:
-    """Log when the agent starts and stops speaking, and when the user starts.
-
-    Why this exists: on 2026-07-27 we tried to measure barge-in latency from the
-    default logs and could not. The only visible signal was that an assistant
-    ``conversation_item_added`` line carried truncated text — but that line is
-    emitted as bookkeeping when the *user's* turn commits, so it lands 2-5 ms
-    after the final STT transcript every single time, regardless of when audio
-    actually stopped. Three different interruption configs produced the same
-    2-5 ms offset, which is the giveaway: we were measuring the logger, not the
-    agent.
-
-    The pair below is the actual measurement. ``user_state`` flips to "speaking"
-    on VAD onset; ``agent_state`` leaves "speaking" when playout stops. The
-    difference between those two timestamps is barge-in latency, and nothing
-    else in the pipeline sits between them.
-
-    Source: https://docs.livekit.io/agents/build/events/
-    """
-    import time
-
-    marks: dict[str, float] = {}
-
-    @session.on("user_state_changed")
-    def _on_user(ev: Any) -> None:
-        if getattr(ev, "new_state", None) == "speaking":
-            marks["user_speaking_at"] = time.time()
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "user_started_speaking",
-                        "timestamp": round(marks["user_speaking_at"], 4),
-                    }
-                )
-            )
-
-    @session.on("agent_state_changed")
-    def _on_agent(ev: Any) -> None:
-        old_state = getattr(ev, "old_state", None)
-        new_state = getattr(ev, "new_state", None)
-        if new_state == "speaking":
-            marks["agent_speaking_at"] = time.time()
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "agent_started_speaking",
-                        "timestamp": round(marks["agent_speaking_at"], 4),
-                    }
-                )
-            )
-        elif old_state == "speaking":
-            now = time.time()
-            started = marks.get("user_speaking_at")
-            # Only a stop that follows a user onset is a barge-in. A stop with no
-            # preceding onset is the agent simply finishing its sentence.
-            overlap = (
-                now - started if started and started > marks.get("agent_speaking_at", 0) else None
-            )
-            logger.info(
-                json.dumps(
-                    {
-                        "event": "agent_stopped_speaking",
-                        "timestamp": round(now, 4),
-                        "to_state": new_state,
-                        "barge_in_latency_ms": round(overlap * 1000, 1) if overlap else None,
-                    }
-                )
-            )
 
 
 if __name__ == "__main__":

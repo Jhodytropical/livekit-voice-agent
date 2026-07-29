@@ -21,6 +21,8 @@ from livekit.agents.llm import ToolError
 
 from .appointments import DemoCalendar, DemoCrm, build_appointment_runtime
 from .config import Settings
+from .readback import ReadbackMismatch
+from .readback import verify as verify_readback
 from .tool_runtime import RetryPolicy, ToolOutcome, ToolRuntime
 
 logger = logging.getLogger("voice_agent.agent")
@@ -48,9 +50,39 @@ How to work:
 - If a tool reports an error, tell the caller plainly what happened and offer an
   alternative. Do not guess at a result you did not get.
 
+What you may confirm:
+- Only confirm what a tool actually recorded. When you read a booking back, state
+  the time and nothing else you did not send to book_appointment.
+- The same rule governs what you say about availability. Describe exactly the times
+  check_availability returned. Do not say a time is the only one, the last one, or
+  the closest one unless the tool result actually shows that, and if the caller asks
+  about a part of the day, name every slot the tool returned in that range.
+- If the caller asks for something the booking cannot record — a specific person,
+  a room, an accommodation, a preference of any kind — do not fold it into your
+  confirmation. Say plainly that you cannot guarantee it on this call and that you
+  will pass it along, then carry on.
+- Never say an appointment is "set for" or "arranged with" a detail you did not
+  send to a tool. A caller who hangs up believing something you never recorded is
+  worse than a caller you told no.
+
 Never quote prices and never promise a timeline.
 """
 
+
+# The availability clause was added after run 4 (2026-07-28): with 09:00, 10:00, 13:00
+# and 15:00 all open, the agent told a caller "there is only a slot at three PM in the
+# afternoon." It did not invent a slot — that guard has held five runs — but it asserted
+# an exclusivity the tool result contradicted, which loses a booking just as surely.
+# Same overclaim family as the confirmation bug, and the original wording did not reach
+# it because it governed confirmations rather than descriptions.
+#
+# The "What you may confirm" block above exists because of run 3 (2026-07-28). A caller
+# asked for a female doctor; the agent acknowledged it, booked, and then confirmed the
+# appointment was "set for 1 PM tomorrow with a female doctor." Nothing had recorded that
+# preference — BookAppointmentArgs has extra="forbid", so the model could not have passed
+# it even if it had tried. The schema held. The spoken confirmation did not, and that is
+# the more dangerous half: the date-anchor bug below failed visibly, this one fails
+# silently. See docs/acceptance-findings.md, run 3, defect 1.
 
 # On the first live call (2026-07-27) the model was asked for "tomorrow" and called
 # check_availability with 2024-06-03, then 2024-06-05 — dates from its training data.
@@ -145,6 +177,27 @@ class AppointmentAgent(Agent):
         # once, so they hear one confirmation, and the calendar saw one write.
         return {**result, "already_recorded": outcome.status == "replayed"}
 
+    def _recent_assistant_messages(self) -> list[str]:
+        """The agent's own recent utterances, oldest first.
+
+        Read defensively: ``chat_ctx`` is a framework structure and this runs on the
+        path to a write, so a shape change upstream must not take the booking down
+        with it. An empty list makes the read-back check fail closed, which is the
+        safe direction.
+        """
+        try:
+            items = list(getattr(self.chat_ctx, "items", []) or [])
+        except Exception:  # pragma: no cover - defensive
+            return []
+        out: list[str] = []
+        for item in items:
+            if getattr(item, "role", None) != "assistant":
+                continue
+            text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", None)
+            if isinstance(text, str) and text.strip():
+                out.append(text)
+        return out
+
     # ---- tools --------------------------------------------------------
 
     @function_tool()
@@ -185,6 +238,16 @@ class AppointmentAgent(Agent):
         # out loud. Source: docs.livekit.io/agents/logic/tools/definition.md
         # ("Disable interruptions for mutating calls").
         context.disallow_interruptions()
+
+        # Structural read-back check. Run 5 session 1 read back ten digits and wrote
+        # eleven, having bundled the confirmation with a second question so the caller
+        # never agreed to the number at all. The instruction to read it back was already
+        # there; this is the part that does not depend on the model following it.
+        # See readback.py and docs/acceptance-findings.md, run 5, defect 6.
+        try:
+            verify_readback(phone, self._recent_assistant_messages())
+        except ReadbackMismatch as exc:
+            raise ToolError(str(exc)) from exc
         return await self._invoke(
             context,
             "book_appointment",

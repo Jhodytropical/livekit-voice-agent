@@ -31,5 +31,11 @@ models/
 # Local run logs — may contain caller names/numbers. Never commit.
 logs/
 
-# Local edit backups — never publish.
+# Local edit backups — never publish. The trailing * matters: the convention in this
+# project is `file.md.bak.20260728`, which a bare `*.bak` pattern does not match.
 *.bak
+*.bak.*
+*.bak[0-9]*
+
+# Scratch dir used when a tool cannot unlink (device-bridge mounts refuse rm).
+_to_delete/

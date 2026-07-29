@@ -26,9 +26,10 @@ Built against **`livekit-agents==1.6.7`** (released 2026-07-25) on Python 3.12.8
 | Refusal to invent availability | **Verified live**, under pressure. See [Live findings](#live-findings-2026-07-27) |
 | Date handling | **Bug found live and fixed.** See [Live findings](#live-findings-2026-07-27) |
 | Barge-in — does it interrupt? | **Verified live.** Speech truncates mid-phrase, caller's words survive intact, agent answers the interruption |
-| Barge-in — *how fast*, in ms | **n=5, 449–1200 ms, median 653 ms.** Every sample confirmed by two independent signals — see [Measured barge-in latency](#measured-barge-in-latency-live-calls) |
-| Recorded demo call | Screen recording captured; not yet cut |
-| Azure Container Apps deploy | **Built, never run.** Manifest and script verified by construction — no resource created, no image built, no call answered by a container. See [Deploy](#deploy-azure-container-apps) |
+| Barge-in — *how fast*, in ms | **n=9, 400.7–1200 ms, median 653 ms**, across local and hosted runs. Every sample confirmed by two independent signals — see [Measured barge-in latency](#measured-barge-in-latency-live-calls) |
+| Read-back guard before a write | **Fired on a live hosted call and blocked a mismatched number**, 2026-07-28 run 8. Not just unit-tested |
+| Recorded demo call | Screen recordings captured; not yet cut |
+| Azure Container Apps deploy | **Run — 2026-07-28.** Built, deployed, and a live call answered by the container with no local process running. Torn down afterwards; `infra/` reproduces it in ~10 min. See [Deploy](#deploy-azure-container-apps) |
 
 Nothing in this README claims a working cloud session it didn't have. Every
 "verified" statement maps either to a command in [Verification](#verification) or
@@ -231,8 +232,22 @@ download (verified: empty cache, `HF_HUB_OFFLINE=1`, loads in 2.3 s); the only t
 because `turn_handling.py` pins `turn_detection: "vad"`. Build with
 `BAKE_TURN_DETECTOR=1` if you make that swap.
 
-**Not yet deployed.** See [Blocked](#blocked--not-verified) item 14 — the artifacts are
-verified by construction, not by a run.
+**Deployed and verified with a live call on 2026-07-28** (`docs/acceptance-findings.md`,
+run 8): cold start to `registered worker` in **2.46 s**, one job handled end-to-end with no
+local process running, PII redaction holding into Log Analytics, and the read-back guard
+blocking a mismatched phone number before the write. Torn down afterwards — this script
+reproduces it in about ten minutes, which is why the durable asset is `infra/` and not a
+running container.
+
+**Write the log to disk before you tear down:**
+
+```bash
+az containerapp logs show -n ca-voice-agent -g rg-voice-agent --tail 300 > logs/azure_run8.log
+az group delete -n rg-voice-agent --yes --no-wait
+```
+
+That order is not cosmetic. Run 8's log was nearly lost by doing it the other way round —
+see [Blocked](#blocked--not-verified) item 15.
 
 ---
 
@@ -381,19 +396,28 @@ A stop counts as a barge-in only when **both** independent signals agree: the fr
 issued an interrupt (`SpeechHandle.interrupted`, stamped on the utterance's own message)
 **and** the agent's speech was actually cut off mid-sentence.
 
-| # | ms |
-|---|---|
-| 1 | **449** |
-| 2 | **549** |
-| 3 | **653** |
-| 4 | **1200** |
-| 5 | **1200** |
+| Run | Where the agent ran | Samples (ms) |
+|---|---|---|
+| 7 | local, macOS | 449 · 549 · 653 · 1200 · 1200 |
+| 8 | **Azure Container Apps, `eastus2`** | 400.7 · 551.9 · 702.4 · 801.3 |
 
-**n=5 · min 449 · median 653 · max 1200 · mean 810.** Measured 2026-07-28, run 7.
+**n=9 · min 400.7 · median 653 · max 1200 · mean 723.** Runs 7 and 8, 2026-07-28.
 
-**Do not quote a sub-450 ms figure, and do not quote the median as a ceiling.** Three
-samples cluster 449–653 ms and two sit at ~1200 ms. The honest sentence is: *the agent
-yields inside about a second, typically around 650 ms.*
+**Do not quote the median as a ceiling.** The distribution is wide — most samples sit
+between 400 and 800 ms, two sit at ~1200 ms. The honest sentence is: *the agent yields
+inside about a second, typically around 650 ms, with a measured floor near 400 ms.*
+
+**Run 8's tighter spread is not evidence that hosting is faster.** The audio topology
+differs — browser → LiveKit `US East B` → worker in Azure `eastus2`, versus browser →
+LiveKit → worker on the same Mac. Two paths, n=4 on one of them. It is a wider dataset,
+not a comparison.
+
+**What run 8 does establish** is that the instrument behaves the same on infrastructure it
+was not developed against. Twelve agent stops in that call: **4 confirmed barge-ins, 4
+coincident stops correctly excluded, 4 clean finishes.** One excluded stop had an overlap
+of **18 ms** — under the v2 instrument this call would have reported eight barge-ins and an
+"18-millisecond" fastest sample, which describes the agent finishing its sentence as the
+caller began talking. A 50% contamination rate, reproduced on a second platform.
 
 **Why it took five attempts to measure this.** Earlier versions of the instrument produced
 349 ms, then 502–1100 ms, then nothing at all. Each was wrong in a different direction:
@@ -835,36 +859,41 @@ Honest list. None of these are hidden elsewhere in this README.
 13. **LiveKit's own test framework not used.** `session.run(user_input=…)` and the
    `judge()` helpers require an LLM instance, so they need credentials. The tests here
    drive `AgentSession` directly instead.
-14. **Never deployed.** `Dockerfile`, `infra/containerapp.yaml` and
-   `infra/deploy-azure.sh` exist and are verified by construction — the manifest
-   deserializes through the same SDK models `az containerapp create --yaml` uses, the
-   secret-rendering step round-trips hostile values byte-for-byte, `shellcheck` is clean,
-   and every `az` flag was checked against the installed CLI. **None of it has run.** No
-   Azure resource has been created, no image built, and no call has been answered by a
-   container. "Deployable" is the claim; "deployed" is not.
+14. ~~**Never deployed.**~~ **Deployed and exercised 2026-07-28** — see
+   [Deploy](#deploy-azure-container-apps) and `docs/acceptance-findings.md`, run 8. The
+   remaining honest limits: **one** call, **one** region, and the deployment was torn down
+   afterwards, so nothing is running now. Autoscaling is unproven — capacity is one
+   worker's job slots, because a KEDA rule keyed on active jobs would need that metric
+   exported first. Say "deployed to Azure Container Apps and verified with a live call",
+   not "running in production".
+15. **The run-8 log was not preserved before teardown.** The resource group was deleted
+   before `az containerapp logs show` was written to a file; the attempted export returned
+   `ResourceNotFound`. `logs/azure_run8.log` is a terminal capture, labelled as such in its
+   own header, and every figure quoted from it was re-derived by parsing it. Nothing not
+   already captured is recoverable, and the Log Analytics workspace is gone.
+   **Rule: write the log to disk before deleting the resource group.**
 
 ### Next, in order
 
-Items 1–5 of the previous list are done: the barge-in instrument was corrected through
-five versions and re-measured (run 7), the confirmation guard was extended to availability
-statements, `book_appointment` ran end-to-end on live audio, `capture_lead` ran live, and
-the cough test finally landed in the log. What is left:
+The Azure deploy is done (run 8). What is left, in order:
 
-1. **Run the Azure deploy.** `./infra/deploy-azure.sh`, confirm `registered worker` in the
-   container's logs, then place a real call with no local `dev` process running. This is
-   the only item that converts "deployable" into "deployed", and it blocks a $100–150/hr
-   job class that screens on it.
-2. **Read-back check for `capture_lead`** (Blocked item 7). `book_appointment` refuses to
-   write unless its own read-back matches; `capture_lead` has no equivalent. An oversight,
-   not a decision, and the fix is the existing `verify_readback` call.
-3. **Stop reciting the full phone number after the write** (Blocked item 8). Read-back
+1. **Read-back check for `capture_lead`** (Blocked item 7). `book_appointment` refuses to
+   write unless its own read-back matches — and run 8 showed that guard earning its keep on
+   a live call. `capture_lead` has no equivalent, writes a phone number, and the fix is the
+   `verify_readback` call that already exists. This is now the largest gap between two tools
+   that do the same dangerous thing.
+2. **Stop reciting the full phone number after the write** (Blocked item 8). Read-back
    *before* a write is deliberate; repeating the digits afterwards is spoken into whatever
    room the caller is in.
-4. **Widen the barge-in sample.** n=5 on one mic, one region. The instrument is now
-   trustworthy; the dataset is not yet wide enough to characterise a phone call.
-5. `min_words=0` on one call, for comparison — now meaningful, since item 1 of the old
-   list is fixed and the baseline can be trusted.
-6. Cut a recorded call into a demo. Raw footage: runs 3, 4 and 5 screen recordings.
+3. **A runtime-only lock file.** The image installs `requirements.lock.txt` whole, so
+   `mypy`, `ruff` and `pytest` — about 30 MB — ship inside the production container with no
+   runtime purpose. Split the lock rather than trimming by hand.
+4. **Widen the barge-in sample.** n=9 across two platforms, still one microphone and one
+   network path. The instrument is trustworthy; the dataset does not yet characterise a
+   phone call.
+5. `min_words=0` on one call, for comparison — now meaningful, since the baseline can be
+   trusted.
+6. Cut a recorded call into a demo. Raw footage: runs 3, 4, 5 and 8 screen recordings.
 
 ---
 

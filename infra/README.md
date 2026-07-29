@@ -207,6 +207,19 @@ by a `dev` process still running on a laptop against the same LiveKit project.
 Two registered workers means the job goes to whichever LiveKit picks, and the
 deploy proves nothing.
 
+### Save the log BEFORE you tear down
+
+```bash
+az containerapp logs show -n ca-voice-agent -g rg-voice-agent --tail 300 > logs/azure_run8.log
+az group delete -n rg-voice-agent --yes --no-wait
+```
+
+That order is a rule, not a suggestion. On the first real deploy it was done the
+other way round: the export was attempted two minutes after `az group delete` and
+returned `ResourceNotFound`, taking the Log Analytics workspace with it. The
+evidence survived only because it was still in the operator's terminal scrollback.
+The teardown command is cheap to re-run; the evidence is not.
+
 ---
 
 ## What has and has not been run
@@ -227,8 +240,33 @@ Stated precisely, because this repo's rule is that a claim needs a run behind it
 - Every `az` flag used here checked against `az --help` on the installed CLI
   (2.88.0, `containerapp` extension 1.3.0b4) rather than written from memory.
 
-**Not yet run:** the deploy itself. No Azure resource has been created, no image
-built, and no call has been answered by a container. Until `az acr build`
-and `az containerapp create` have run against a real subscription and a live
-call has been handled, this is a verified-by-construction deployment, not a
-verified-by-execution one — and it should be described that way.
+**Verified by running it — 2026-07-28** (full write-up: `docs/acceptance-findings.md`,
+run 8):
+
+- The whole script, end to end, against subscription *MITS SFL Learning*. Build
+  `ch1` succeeded in **2m1s**; total wall clock about ten minutes.
+- **`registered worker`** at `02:16:14`, **2.46 s** after `starting worker` — with
+  the 461 MB bake skipped, proving Silero loads from the wheel in a real image.
+- Only three plugins registered (`deepgram`, `openai`, `silero`). The turn
+  detector was never loaded, exactly as `BAKE_TURN_DETECTOR=0` assumes.
+- `HTTP server listening on :8081` — the port the probes point at.
+- `ingress: null` on the deployed resource. No public FQDN.
+- One live call handled end to end with **no local `dev` process running**, so the
+  job could only have gone to the container.
+- PII redaction held into **Log Analytics**, a third-party sink: `transcript
+  logging: redacted`, `caller_name: "M***[redacted]"`, `phone: "******0142"`.
+
+**One bug this deploy found, in the script itself.** The Verify block ran under
+`set -euo pipefail` and aborted on `Subscription ... is not registered for the
+Microsoft.App resource provider` — *after* the container app had been created
+successfully. `az provider register --wait` returns before the Container Apps
+control plane sees the registration everywhere; the extension retries internally,
+a plain `az containerapp show` does not. A verification step that reports failure
+for work that succeeded is worse than none, so Verify now runs under `set +e`,
+retries six times, and says explicitly that an unreadable state is not a failed
+deploy.
+
+**Still not verified:** autoscaling. Capacity is one worker's job slots, because a
+KEDA rule keyed on active jobs needs that metric exported first. And this is one
+call in one region — say *"deployed to Azure Container Apps and verified with a
+live call"*, not *"running in production"*.

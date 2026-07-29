@@ -1000,3 +1000,221 @@ as untested rather than chased.**
 The script asked for a confirmation answered with a *different* question, to test whether
 the agent writes without agreement. The caller confirmed properly both times. The structural
 check verifies the digits match; **nothing yet verifies the caller said yes.** Open.
+
+---
+
+# Run 8 — 2026-07-28, 22:24–22:27 EDT (first call on hosted infrastructure)
+
+**The first call in this project's history not answered by a laptop.**
+
+| | |
+|---|---|
+| Platform | Azure Container Apps, `eastus2` |
+| Revision | `ca-voice-agent--i2w0xyg` |
+| Image | `voice-agent:9327aad` · `sha256:b70a3df35440ee77b7c61a70aa28cb7a77e7a5fa4500c85cd4e138f5005fc619` |
+| Worker | `AW_Kzyc635VEpXg`, LiveKit region `US East B`, protocol 17 |
+| Job | `AJ_Trkg3JdeCLZi`, room `console-a6abce5c` |
+| Client | Browser Agent Console from the operator's Mac |
+| Caller | Synthetic — Marcus Webb, 305-555-0142, `DemoCalendar` |
+
+**Control that makes this meaningful:** no local `dev` process was running. A single worker
+was registered against the LiveKit project, so the job could only have gone to the container.
+
+> **Log preservation note — read this before trusting the numbers below.**
+> The resource group was deleted before the log was exported. The attempted dump, run two
+> minutes later, returned:
+>
+> ```
+> ERROR: Not Found({"error":{"code":"ResourceNotFound","message":"The Resource
+> 'Microsoft.App/containerApps/ca-voice-agent' under resource group 'rg-voice-agent'
+> was not found."}})
+> ```
+>
+> `logs/azure_run8.log` is therefore a **terminal capture**, not an `az` export, and it says
+> so in its own header. The Log Analytics workspace went with the resource group.
+>
+> What that does and does not undermine: every figure in this section was **re-derived
+> programmatically from that file** — the JSON events were parsed, not eyeballed — so the
+> counts and latencies are exactly what the agent emitted. What is lost is the ability to go
+> back for anything not already captured. That is a real cost, and it was avoidable.
+
+---
+
+## ✅ Cold start — 2.46 seconds, with the model bake skipped
+
+```
+02:16:11.689  starting worker            version 1.6.7, rtc-version 1.1.13
+02:16:11.689  plugin registered          livekit.plugins.deepgram
+02:16:11.689  plugin registered          livekit.plugins.openai
+02:16:11.689  plugin registered          livekit.plugins.silero
+02:16:11.705  HTTP server listening on :8081
+02:16:14.152  registered worker          agent_name=appointment-agent  region="US East B"
+```
+
+Three claims from `infra/README.md` are settled by those six lines:
+
+1. **Silero loaded from the wheel.** The image ships an empty `HF_HOME` — the 461 MB
+   turn-detector bake was skipped via `BAKE_TURN_DETECTOR=0` — and the VAD still came up.
+   The offline test predicted this; the container confirmed it.
+2. **The turn detector is genuinely never loaded.** Only three plugins registered. The
+   `livekit-plugins-turn-detector` package is installed and was never touched, which is
+   exactly why baking its weights would have been 461 MB of dead image.
+3. **Port 8081, not a random dev port.** `HTTP server listening on :8081` — so the liveness
+   and startup probes in `infra/containerapp.yaml` point at something real.
+
+`starting worker` → `registered worker` = **2.46 s**.
+
+---
+
+## ✅ THE HEADLINE — the read-back guard fired on a live call and blocked a wrong write
+
+```
+02:26:27.921  ToolError while executing tool: the number you read back does not match
+              the number you are booking — read it back again digit by digit and get
+              an explicit yes
+              function=book_appointment  speech_id=speech_660da7e4ec1e  level=WARNING
+```
+
+Twenty-two seconds later, after the agent re-read the digits and the caller confirmed:
+
+```
+02:26:49.522  "tool": "book_appointment",
+              "turn_id": "speech_a6c4b3be0d3e",
+              "idempotency_key": "tk_3aa1ca609cd54d792d65c97c6e2ab129",
+              "args": {"slot_id": "2026-07-30T09:00",
+                       "caller_name": "M***[redacted]",
+                       "phone": "******0142",
+                       "email": null,
+                       "reason": "d***[redacted]"},
+              "status": "ok", "attempts": 1, "latency_ms": 0.23
+```
+
+**This is the most valuable line the project has produced.** `verify_readback` was written on
+2026-07-28 in response to run 5's defect 6, where the agent read back eleven 5s and wrote ten.
+The first version of that check compared *trailing digits* and would have let the original bug
+through — every suffix matched — which is why it ships as exact equality instead.
+
+Here it caught a genuine mismatch, on a hosted worker, on live audio, and forced a correction
+before anything was written. Note the write that followed shows `"attempts": 1` — the guard
+raised before the handler ran, so nothing partial was committed and no retry was consumed.
+
+A passing unit test proves a guard is *wired*. This proves it *works on the thing it was
+built for*. Claimable without qualification.
+
+---
+
+## ✅ PII redaction held on hosted infrastructure
+
+```
+02:24:50.195  transcript logging: redacted
+```
+
+and in the only tool call carrying caller data:
+
+```
+"caller_name": "M***[redacted]",  "phone": "******0142",  "reason": "d***[redacted]"
+```
+
+Every prior verification of redaction was on a laptop, where the operator controls the log
+file. This one ran into **Azure Log Analytics** — a third-party sink, retained by default,
+readable by anyone with subscription access. Not one word of caller speech reached it.
+
+`LOG_TRANSCRIPTS` is deliberately absent from `infra/containerapp.yaml`; this is the run that
+shows why that mattered.
+
+---
+
+## ✅ Barge-in instrument v5 — validated on infrastructure it was not developed on
+
+Twelve agent stops in one call. The v5 record classifies each by pairing the stop with its own
+assistant item and requiring both signals to agree:
+
+| Class | Count | What the record says |
+|---|---|---|
+| **Confirmed barge-in** | **4** | `playout_interrupted: true`, `text_truncated: true`, latency reported |
+| **Coincident stop** | **4** | both `false`, `barge_in_latency_ms: null`, `user_overlap_ms` set |
+| **Clean finish** | **4** | both `false`, both timings `null` |
+
+The four confirmed samples:
+
+| Time | ms |
+|---|---|
+| 02:25:31.53 | **801.3** |
+| 02:25:41.38 | **551.9** |
+| 02:26:01.98 | **400.7** |
+| 02:26:24.68 | **702.4** |
+
+**n=4 · min 400.7 · median 627.15 · max 801.3 · mean 614.1**
+*(computed by parsing `logs/azure_run8.log`, not by reading the table above.)*
+
+And the four the instrument correctly refused to count, with their overlaps:
+**533.7 · 253.0 · 229.8 · 18.0 ms.**
+
+> **That 18.0 ms entry is the whole argument for v5 in one number.** Under the v2 instrument —
+> "any stop following a user onset" — this call would have reported **eight** barge-ins instead
+> of four, and the fastest would have been **18 milliseconds**. That figure would have been
+> quoted in a proposal. It describes the agent finishing its sentence at the same moment the
+> caller started talking, which is not an interruption at all.
+>
+> The contamination rate here is **exactly 50%**, on hosted infrastructure, in a call the
+> instrument was not tuned against. The 13-of-17 figure from run 5 was not a fluke of one
+> laptop's acoustics.
+
+### Combined dataset
+
+| Run | Platform | Samples (ms) |
+|---|---|---|
+| 7 | local (macOS) | 449 · 549 · 653 · 1200 · 1200 |
+| 8 | Azure Container Apps | 400.7 · 551.9 · 702.4 · 801.3 |
+
+**n=9 · min 400.7 · median 653 · max 1200 · mean 723.**
+
+**The "never quote sub-450 ms" rule is superseded.** 400.7 ms is corroborated by both signals
+and is now the floor. The honest sentence becomes: *the agent yields inside about a second,
+typically around 650 ms, with a measured floor near 400 ms.*
+
+**Do not read run 8's tighter spread as evidence that Azure is faster.** The audio topology
+changed — browser → LiveKit `US East B` → worker in `eastus2`, versus browser → LiveKit →
+worker on the same Mac. Two different paths, n=4 on one of them. It is a wider dataset, not
+a comparison.
+
+---
+
+## ✅ Everything else that held
+
+| Behaviour | Evidence |
+|---|---|
+| Config reached the container intact | `credentials_present: [all 5]`, `credentials_missing: []` |
+| Shipping barge-in config unchanged in prod | `interruption_min_duration: 0.4`, `min_words: 2`, `endpointing: [0.4, 3.0]` |
+| `check_availability` executes | ×2, `status: ok`, `attempts: 1`, 0.14 ms and 0.15 ms |
+| Idempotency keys derived per turn | `tk_ee2cf80…` and `tk_232170d…` — different turns, different keys |
+| Teardown | The three `data channel closed unexpectedly` ERRORs at 02:27:52 are the known, expected shutdown noise. Not a defect. |
+
+The two `check_availability` calls carry **different `turn_id`s** (`speech_df6c7c652729`,
+`speech_b7aca4305cc8`), so this is the agent re-checking across turns, not a replay. It does
+not exercise the `once_per_turn` ledger.
+
+---
+
+## ⚠️ Still not exercised, nine calls in
+
+Unchanged by this run, and listed so the tally stays honest:
+
+1. **`once_per_turn` ledger** — never fired live.
+2. **Calendar conflict guard** — never fired live.
+3. **Barge-in during an uninterruptible write** — no write was in flight when the caller
+   talked over the agent.
+4. **`capture_lead` read-back check** — the defect logged in run 7 is still unfixed, and
+   `capture_lead` was not called in this run.
+5. **Nothing verifies the caller said yes.** The structural check confirms the digits match;
+   agreement is still unverified. Run 8 does not change this — the caller confirmed properly.
+
+## 🔴 Process defect — the log was not preserved before teardown
+
+The resource group was deleted with `--no-wait` before `logs/azure_run8.log` was written.
+The reconstruction from the terminal capture is complete for everything quoted here, but
+anything not already extracted is unrecoverable, and so is the Log Analytics workspace.
+
+**Rule this creates:** *write the log to disk before deleting the resource group.* Added to
+`infra/README.md`'s verification section. The teardown command is cheap to re-run; the
+evidence is not.

@@ -306,30 +306,73 @@ cleanup
 WORKDIR=""
 
 # ---- 9. verify -------------------------------------------------------------
+#
+# Everything above this line has already been created. A read that fails here is
+# a reporting problem, not a deployment problem — so this whole section runs with
+# `set +e` and can never abort the script. The first version did abort, on the
+# first real run, with "Subscription is not registered for the Microsoft.App
+# resource provider" — AFTER the container app had been successfully created.
+# An operator reading that output reasonably concludes the deploy failed. It had
+# not. A verification step that reports failure for work that succeeded is worse
+# than no verification step.
+#
+# Root cause of that read failure: `az provider register --wait` returns once the
+# subscription-level registration is recorded, but the Container Apps control
+# plane takes longer to see it everywhere. The containerapp extension absorbs
+# this internally (it prints "Registering resource provider Microsoft.App ..."
+# and retries); a plain `az containerapp show` does not. Hence the retry below.
 say "Verify"
 
-PROVISIONING="$(az containerapp show -n "$APP_NAME" -g "$RESOURCE_GROUP" \
-                 --query "properties.provisioningState" -o tsv)"
-info "provisioningState : $PROVISIONING"
+set +e
+
+REG_STATE="$(az provider show -n Microsoft.App --query registrationState -o tsv 2>/dev/null)"
+info "Microsoft.App     : ${REG_STATE:-unreadable}"
+
+# Retry the first read: on a subscription where Microsoft.App was registered
+# minutes ago, this is the call that trips over propagation lag.
+PROVISIONING=""
+ATTEMPT=1
+while [ "$ATTEMPT" -le 6 ]; do
+  PROVISIONING="$(az containerapp show -n "$APP_NAME" -g "$RESOURCE_GROUP" \
+                   --query "properties.provisioningState" -o tsv 2>/dev/null)"
+  [ -n "$PROVISIONING" ] && break
+  info "provisioningState : not readable yet (attempt $ATTEMPT/6) — retrying in 10s"
+  sleep 10
+  ATTEMPT=$((ATTEMPT + 1))
+done
+
+if [ -n "$PROVISIONING" ]; then
+  info "provisioningState : $PROVISIONING"
+else
+  info "provisioningState : STILL UNREADABLE after 6 attempts."
+  info "                    This does NOT mean the deploy failed — the container"
+  info "                    app was created above. Re-run the three commands"
+  info "                    printed at the end of this script in a minute or two."
+fi
 
 FQDN="$(az containerapp show -n "$APP_NAME" -g "$RESOURCE_GROUP" \
-         --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null || true)"
+         --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null)"
 if [ -z "$FQDN" ] || [ "$FQDN" = "null" ]; then
-  info "public FQDN      : none  <-- correct, this worker has no ingress"
+  info "public FQDN       : none  <-- correct, this worker has no ingress"
 else
-  info "public FQDN      : $FQDN  <-- UNEXPECTED. This app should have no ingress."
+  info "public FQDN       : $FQDN  <-- UNEXPECTED. This app should have no ingress."
 fi
 
 info "replicas:"
 az containerapp replica list -n "$APP_NAME" -g "$RESOURCE_GROUP" \
-  --query "[].{replica:name, state:properties.runningState}" -o table 2>/dev/null || true
+  --query "[].{replica:name, state:properties.runningState}" -o table 2>/dev/null
+
+set -e
 
 say "Last check: did the worker actually register with LiveKit?"
 cat <<'EOS'
 The deploy is only half the evidence. A container that is "Running" but never
-registered takes no calls and looks perfectly healthy in the portal. Tail the
-logs and look for the line that proves otherwise:
+registered takes no calls and looks perfectly healthy in the portal. These three
+are the real check — and they are also what to re-run if anything above reported
+"not readable yet":
 
+  az containerapp show -n ca-voice-agent -g rg-voice-agent --query "properties.provisioningState" -o tsv
+  az containerapp replica list -n ca-voice-agent -g rg-voice-agent -o table
   az containerapp logs show -n ca-voice-agent -g rg-voice-agent --follow --tail 100
 
 Expected within ~30s of the replica starting:

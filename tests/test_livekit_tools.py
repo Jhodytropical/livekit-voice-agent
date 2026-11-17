@@ -9,6 +9,7 @@ covered in the other test modules.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 
 import pytest
 from livekit.agents.llm import ToolError
@@ -35,6 +36,9 @@ class _FakeRunContext:
         self.interruptions_disallowed += 1
 
 
+#: A fixed Monday; BOOK_ARGS and the availability check use the next day.
+TODAY = date(2026, 7, 27)
+
 BOOK_ARGS = {
     "slot_id": "2026-07-28T10:00",
     "caller_name": "Ada Lovelace",
@@ -51,9 +55,11 @@ READBACK = "To confirm, three oh five, five five five, oh one four two — is th
 
 
 def _agent(*, readback: str | None = READBACK) -> tuple[AppointmentAgent, DemoCalendar, DemoCrm]:
-    calendar, crm = DemoCalendar(), DemoCrm()
+    # Pin "today" the way test_appointment_tools.py does, so the fixed 2026-07-28
+    # slot stays in the future. Unpinned, these tests broke once that date passed.
+    calendar, crm = DemoCalendar(today=TODAY), DemoCrm()
     runtime = build_appointment_runtime(calendar=calendar, crm=crm)
-    agent = AppointmentAgent(runtime=runtime)
+    agent = AppointmentAgent(runtime=runtime, today=calendar.today)
     agent._recent_assistant_messages = lambda: [readback] if readback else []  # type: ignore[method-assign]
     return agent, calendar, crm
 
